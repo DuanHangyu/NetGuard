@@ -73,6 +73,15 @@ module NetGuard
       extracted['proxy_endpoints'].length
     end
 
+    # What the monitor follows. Clash Verge's runtime file is what Clash actually
+    # runs, and unlike ~/Downloads, ~/Documents or ~/Desktop it is not behind macOS
+    # privacy protection, so the root daemon can read it. A hand-picked file is
+    # only used when Clash Verge is not installed. The user's home comes from the
+    # NetGuard home (~/.netguard) because root's Dir.home is /var/root.
+    def follow_path
+      self.class.verge_runtime_path(File.dirname(@home)) || @data['clash_config']
+    end
+
     # True when the endpoint-relevant parts of the Clash config differ from ours.
     def clash_changed?(extracted)
       extracted['proxy_endpoints'] != @data['proxy_endpoints'] || extracted['bootstrap_dns'] != @data['bootstrap_dns']

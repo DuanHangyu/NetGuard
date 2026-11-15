@@ -349,4 +349,16 @@ class NetGuardTest < Minitest::Test
     File.write(path, 'proxies: []')
     assert_equal path, NetGuard::Config.verge_runtime_path(@tmp)
   end
+
+  def test_follow_path_prefers_verge_runtime_under_the_users_home
+    @config.data['clash_config'] = '/Users/someone/Downloads/sub.yaml'
+    assert_equal '/Users/someone/Downloads/sub.yaml', @config.follow_path
+    runtime = File.join(File.dirname(@tmp), NetGuard::Config::VERGE_RUNTIME)
+    created = !File.exist?(runtime)
+    FileUtils.mkdir_p(File.dirname(runtime))
+    File.write(runtime, 'proxies: []') if created
+    assert_equal runtime, @config.follow_path
+  ensure
+    FileUtils.rm_rf(File.join(File.dirname(@tmp), 'Library')) if created
+  end
 end

@@ -54,7 +54,7 @@ module NetGuard
         'exit_ip' => network.value, 'expected_exit_ip' => expected, 'exit_mismatch' => exit_mismatch,
         'pf' => pf, 'pf_problems' => pf_problems,
         'heals' => @heals, 'last_heal' => @last_heal,
-        'clash_config' => @config.data['clash_config'], 'clash_reloaded_at' => @clash_reloaded_at
+        'clash_config' => @config.follow_path, 'clash_reloaded_at' => @clash_reloaded_at
       )
       status = healthy ? 'OK' : 'LOCKED'
       status = 'ALERT 出口变化' if exit_mismatch
@@ -80,7 +80,7 @@ module NetGuard
     end
 
     def follow_clash_config
-      path = @config.data['clash_config']
+      path = @config.follow_path
       return unless path && File.file?(path)
       mtime = File.mtime(path)
       return if mtime == @clash_mtime
