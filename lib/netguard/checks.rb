@@ -4,7 +4,7 @@ require 'timeout'
 
 module NetGuard
   class Checks
-    Result = Struct.new(:name, :ok, :detail, :critical) do
+    Result = Struct.new(:name, :ok, :detail, :critical, :value) do
       def ok?
         !!ok
       end
@@ -21,9 +21,9 @@ module NetGuard
       return Result.new('public_ip', false, "公网检查失败：#{err.strip}", true) unless status.success? && ip.match?(/\A\d{1,3}(\.\d{1,3}){3}\z/)
       expected = config['expected_ip']
       if expected && !expected.to_s.empty? && expected != ip
-        return Result.new('public_ip', false, "出口变化：期望 #{expected}，实际 #{ip}", true)
+        return Result.new('public_ip', false, "出口变化：期望 #{expected}，实际 #{ip}", true, ip)
       end
-      Result.new('public_ip', true, "终端出口：#{ip}", true)
+      Result.new('public_ip', true, "终端出口：#{ip}", true, ip)
     end
 
     def self.all(config)

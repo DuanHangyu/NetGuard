@@ -93,29 +93,85 @@ LOOPBACK_RULE = 'pass quick on lo0 all flags any no state'
                            '启用后 Clash 将无法解析节点，拒绝生成规则。'
     end
 
+    # Kept for compatibility: the monitor daemon (RunAtLoad) now performs the boot
+    # lock itself via heal!, before any DNS or network work.
     def boot_lock!
       raise SecurityError, '需要 root' unless System.root?
       return false unless state['enabled_at']
-      rules = begin
-        plan
-      rescue StandardError
-        lock_only
-      end
-      install_anchor_rules(rules)
+      heal!(force: true)
       true
+    end
+
+    # Exit IP the monitor must see: an explicit config value wins, otherwise the
+    # address recorded when protection was enabled.
+    def expected_exit_ip
+      explicit = config.data['expected_ip'].to_s.strip
+      return explicit unless explicit.empty?
+      locked = state['locked_exit_ip'].to_s.strip
+      locked.empty? ? nil : locked
+    end
+
+    # Live PF state as root sees it. Anything other PF users, macOS updates or a
+    # `pfctl -d` might have undone shows up here.
+    def pf_status
+      main, = System.run('/sbin/pfctl', '-s', 'rules')
+      anchor, = System.run('/sbin/pfctl', '-a', ANCHOR, '-s', 'rules')
+      pf_conf = File.file?(PF_CONF) ? File.read(PF_CONF) : ''
+      {
+        'pf_enabled' => System.pf_enabled?,
+        'anchor_referenced' => main.to_s.lines.any? { |l| l.start_with?("anchor \"#{ANCHOR}\"") },
+        'anchor_rules' => anchor.to_s.lines.count { |l| l.start_with?('pass', 'block') },
+        'pf_conf_managed' => pf_conf.include?("load anchor \"#{ANCHOR}\"")
+      }
+    end
+
+    def self.intact?(status)
+      status['pf_enabled'] && status['anchor_referenced'] && status['anchor_rules'].to_i.positive? && status['pf_conf_managed']
+    end
+
+    def self.describe_problems(status)
+      problems = []
+      problems << 'PF 被关闭' unless status['pf_enabled']
+      problems << '主规则集缺少 NetGuard anchor' unless status['anchor_referenced']
+      problems << 'anchor 内没有规则' unless status['anchor_rules'].to_i.positive?
+      problems << '/etc/pf.conf 缺少托管行' unless status['pf_conf_managed']
+      problems
+    end
+
+    # Re-apply protection if anything was undone. Uses the last installed rules
+    # first (no DNS needed, works at boot), else lock-only. Returns the problems
+    # that were repaired, or [] when protection was already intact.
+    def heal!(force: false)
+      raise SecurityError, '需要 root' unless System.root?
+      status = pf_status
+      return [] if !force && self.class.intact?(status)
+      problems = force ? ['启动时强制加载'] : self.class.describe_problems(status)
+      rules = installed_rules.to_s
+      rules = lock_only unless rules.include?('block out')
+      install_anchor_rules(rules)
+      problems
+    end
+
+    def installed_rules
+      File.file?(ANCHOR_PATH) ? File.read(ANCHOR_PATH) : nil
+    rescue StandardError
+      nil
     end
 
     def enable!(confirmation: nil)
       raise SecurityError, '需要 root；请使用 sudo' unless System.root?
       raise SecurityError, '实际启用需要输入 ENABLE NETGUARD' unless confirmation == 'ENABLE NETGUARD'
       rules = plan
-      raise RuntimeError, '代理当前不可用，拒绝在可能断网的状态下启用' unless Checks.public_ip(config.data).ok?
+      exit_check = Checks.public_ip(config.data)
+      raise RuntimeError, "代理当前不可用，拒绝在可能断网的状态下启用：#{exit_check.detail}" unless exit_check.ok?
 
       FileUtils.mkdir_p(config.home)
       backup = File.join(config.home, 'backups', Time.now.utc.strftime('%Y%m%dT%H%M%SZ'))
       FileUtils.mkdir_p(backup)
       FileUtils.cp(PF_CONF, File.join(backup, 'pf.conf')) if File.file?(PF_CONF)
-      File.write(state_path, YAML.dump({ 'pf_was_enabled' => System.pf_enabled?, 'backup' => backup, 'enabled_at' => Time.now.utc.iso8601 }))
+      # The exit seen now is locked; the monitor alerts whenever it changes.
+      File.write(state_path, YAML.dump({ 'pf_was_enabled' => System.pf_enabled?, 'backup' => backup,
+                                         'enabled_at' => Time.now.utc.iso8601, 'locked_exit_ip' => exit_check.value }))
       File.chmod(0o600, state_path)
       begin
         install_anchor_rules(rules)

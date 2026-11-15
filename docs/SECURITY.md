@@ -6,7 +6,11 @@ PF anchor 的顺序是：回环 → 指定 TUN → 指定代理 IP/端口 → Cl
 
 监控程序没有“网络恢复后关闭 PF”的代码路径。即使监控崩溃，已加载的 PF 规则仍保留。TUN 消失时监控切换到 lock-only；如果连端点解析也失败，规则退化为仅允许回环并阻断其他出站。
 
-`service/com.netguard.boot.plist` 是开机服务模板，不会随项目测试自动安装。只有启用状态已保存时，`boot-lock` 才会加载规则。
+监控以 root LaunchDaemon 运行并随系统启动。每个周期先检查 PF 是否启用、anchor 是否仍被引用且有规则、`/etc/pf.conf` 托管行是否还在，缺任何一项就用上次安装的规则（没有则 lock-only）重新加载并启用 PF。这同时就是开机锁网，不需要 DNS。
+
+紧急恢复（`netguard recovery`）会先停止监控服务，再移除规则，避免监控把刚移除的规则自愈回来。监控发现 state 中已未启用时自行退出，launchd 不会重启正常退出的监控。
+
+启用时锁定当时的出口 IP（`state.yml` 的 `locked_exit_ip`，`expected_ip` 配置优先）。出口变化只告警，不额外断网，避免检查服务本身被阻断后无法恢复。
 
 ## 代理端点与 fake-ip
 
@@ -37,7 +41,7 @@ Clash TUN 的 fake-ip 模式会把节点域名在系统解析里变成 198.18.x�
 - 图形界面的启动按钮与 macOS 管理员授权构成用户确认；辅助程序仍通过标准输入满足 CLI 原有的 `ENABLE NETGUARD` 二次检查，没有删除该核心校验。
 - 启用成功后才安装 `com.netguard.monitor`。监控服务安装或启动失败时只报告错误，**不会为了恢复可用性而自动关闭 PF**。
 - 停止或紧急恢复会先移除监控服务，再只清理 NetGuard 自己的 PF anchor 和托管配置，不修改 Clash 节点、系统代理或浏览器。
-- 图形应用不自动安装 `com.netguard.boot.plist`，因此不能声称已经验证开机早期锁网。
+- 开机保护由监控服务承担；在 launchd 拉起监控之前的极短窗口内不受保护。
 
 ## 故障处理
 

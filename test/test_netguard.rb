@@ -2,6 +2,7 @@
 require 'minitest/autorun'
 require 'tmpdir'
 require 'open3'
+require 'json'
 $LOAD_PATH.unshift(File.expand_path('../lib', __dir__))
 require 'netguard'
 
@@ -74,20 +75,20 @@ class NetGuardTest < Minitest::Test
 
   def test_monitor_failure_never_calls_disable
     @config.save
-    firewall = Object.new
-    def firewall.disable!(*)
-      raise 'monitor must never disable the firewall'
-    end
+    firewall = fake_firewall(state: { 'enabled_at' => 'x' }, pf: INTACT.merge('pf_enabled' => false))
+    firewall.define_singleton_method(:lock_only) { "block out all\n" }
     failed = NetGuard::Checks::Result.new('public_ip', false, 'offline test', true)
-    NetGuard::System.stub(:root?, false) do
+    NetGuard::System.stub(:root?, true) do
       NetGuard::System.stub(:detect_tun, nil) do
         NetGuard::Checks.stub(:public_ip, failed) do
           refute NetGuard::Monitor.new(@config, firewall).tick
         end
       end
     end
-    health = File.read(File.join(@tmp, 'health.json'))
-    assert_includes health, 'fail-closed; never auto-disabled'
+    health = JSON.parse(File.read(File.join(@tmp, 'health.json')))
+    assert_equal 'offline test', health['detail'], 'tick must complete, not crash'
+    assert_includes health['firewall_policy'], 'never auto-disabled'
+    refute_empty firewall.loads, 'a failing proxy must still leave PF rules installed'
   end
 
   def test_cli_doctor_is_read_only
@@ -192,5 +193,160 @@ class NetGuardTest < Minitest::Test
     NetGuard::System.stub(:run, ["240e:1::5\n", '', ok]) do
       refute NetGuard::Checks.ipv6_check.ok?, 'a real IPv6 exit is a leak'
     end
+  end
+  # ---- self-heal, exit lock, boot, Clash runtime config ----------------------
+
+  OK_STATUS = Struct.new(:success?).new(true)
+  INTACT = { 'pf_enabled' => true, 'anchor_referenced' => true, 'anchor_rules' => 5, 'pf_conf_managed' => true }.freeze
+
+  def fake_firewall(state: {}, pf: INTACT, installed: "pass quick on lo0 all\nblock out all\n")
+    firewall = NetGuard::Firewall.new(@config)
+    firewall.define_singleton_method(:state) { state }
+    firewall.define_singleton_method(:pf_status) { pf }
+    firewall.define_singleton_method(:installed_rules) { installed }
+    firewall.define_singleton_method(:disable!) { |*| raise 'monitor must never disable the firewall' }
+    loads = []
+    firewall.define_singleton_method(:install_anchor_rules) { |rules| loads << rules }
+    firewall.define_singleton_method(:loads) { loads }
+    firewall
+  end
+
+  def test_pf_status_parses_live_pfctl_output
+    firewall = NetGuard::Firewall.new(@config)
+    outputs = {
+      %w[-s rules] => "anchor \"com.apple/*\" all\nanchor \"com.netguard\" all\n",
+      %w[-a com.netguard -s rules] => "pass quick on lo0 all no state\nblock drop out all\n"
+    }
+    run = ->(_bin, *args) { [outputs.fetch(args, ''), '', OK_STATUS] }
+    NetGuard::System.stub(:run, run) do
+      NetGuard::System.stub(:pf_enabled?, true) do
+        status = firewall.pf_status
+        assert_equal 2, status['anchor_rules']
+        assert status['anchor_referenced']
+      end
+    end
+  end
+
+  def test_intact_and_problem_descriptions
+    assert NetGuard::Firewall.intact?(INTACT)
+    broken = INTACT.merge('pf_enabled' => false, 'anchor_rules' => 0)
+    refute NetGuard::Firewall.intact?(broken)
+    assert_equal ['PF 被关闭', 'anchor 内没有规则'], NetGuard::Firewall.describe_problems(broken)
+  end
+
+  def test_heal_reapplies_last_rules_when_pf_was_disabled
+    firewall = fake_firewall(pf: INTACT.merge('pf_enabled' => false))
+    NetGuard::System.stub(:root?, true) do
+      assert_equal ['PF 被关闭'], firewall.heal!
+    end
+    assert_equal ["pass quick on lo0 all\nblock out all\n"], firewall.loads
+  end
+
+  def test_heal_is_a_noop_when_intact_and_falls_back_to_lock_only
+    firewall = fake_firewall
+    NetGuard::System.stub(:root?, true) { assert_empty firewall.heal! }
+    assert_empty firewall.loads
+    bare = fake_firewall(installed: nil)
+    bare.define_singleton_method(:lock_only) { "block out all\n" }
+    NetGuard::System.stub(:root?, true) { bare.heal!(force: true) }
+    assert_equal ["block out all\n"], bare.loads
+  end
+
+  def test_expected_exit_ip_prefers_config_then_locked_state
+    firewall = fake_firewall(state: { 'locked_exit_ip' => '203.0.113.1' })
+    assert_equal '203.0.113.1', firewall.expected_exit_ip
+    @config.data['expected_ip'] = '198.51.100.9'
+    assert_equal '198.51.100.9', firewall.expected_exit_ip
+  end
+
+  def test_monitor_heals_first_and_flags_exit_change
+    @config.save
+    firewall = fake_firewall(state: { 'enabled_at' => 'x', 'locked_exit_ip' => '203.0.113.1' },
+                             pf: INTACT.merge('pf_enabled' => false))
+    firewall.define_singleton_method(:plan) { "pass quick on lo0 all\nblock out all\n" }
+    changed = NetGuard::Checks::Result.new('public_ip', false, '出口变化', true, '203.0.113.99')
+    seen_expected = nil
+    check = lambda { |data| seen_expected = data['expected_ip']; changed }
+    monitor = NetGuard::Monitor.new(@config, firewall)
+    NetGuard::System.stub(:root?, true) do
+      NetGuard::System.stub(:detect_tun, 'utun6') do
+        NetGuard::Checks.stub(:public_ip, check) do
+          refute monitor.tick
+        end
+      end
+    end
+    assert_equal '203.0.113.1', seen_expected
+    assert_equal 1, monitor.heals
+    health = JSON.parse(File.read(File.join(@tmp, 'health.json')))
+    assert health['exit_mismatch']
+    assert_equal '203.0.113.99', health['exit_ip']
+    assert_equal ['PF 被关闭'], health['pf_problems']
+    assert_equal ['PF 被关闭'], health.dig('last_heal', 'problems')
+  end
+
+  def test_monitor_reimports_changed_clash_config_and_survives_bad_yaml
+    source = File.join(@tmp, 'clash-verge.yaml')
+    File.write(source, File.read(File.expand_path('fixture.yml', __dir__)))
+    @config.import_clash(source)
+    @config.save
+    firewall = fake_firewall(state: { 'enabled_at' => 'x' })
+    ok = NetGuard::Checks::Result.new('public_ip', true, 'ok', true, '203.0.113.1')
+    monitor = NetGuard::Monitor.new(@config, firewall)
+    run_tick = lambda do
+      NetGuard::System.stub(:detect_tun, nil) do
+        NetGuard::Checks.stub(:public_ip, ok) { monitor.tick }
+      end
+    end
+    run_tick.call
+    File.write(source, "proxies:\n  - {name: n, type: vless, server: 203.0.113.50, port: 8443}\n")
+    File.utime(Time.now + 5, Time.now + 5, source)
+    run_tick.call
+    assert_equal [{ 'host' => '203.0.113.50', 'port' => 8443, 'protocol' => 'tcp' }],
+                 NetGuard::Config.new(@tmp).data['proxy_endpoints']
+    File.write(source, "proxies: [ broken")
+    File.utime(Time.now + 10, Time.now + 10, source)
+    run_tick.call
+    assert_equal 1, NetGuard::Config.new(@tmp).data['proxy_endpoints'].length, 'bad YAML must keep the last good nodes'
+  end
+
+  def test_monitor_stops_once_protection_is_disabled
+    firewall = fake_firewall(state: {})
+    monitor = NetGuard::Monitor.new(@config, firewall)
+    def monitor.tick
+      raise 'must not tick while disabled'
+    end
+    out, = capture_io { monitor.run }
+    assert_includes out, '监控退出'
+  end
+
+  def test_enable_locks_current_exit_ip
+    firewall = NetGuard::Firewall.new(@config)
+    firewall.define_singleton_method(:plan) { "block out all\n" }
+    firewall.define_singleton_method(:install_anchor_rules) { |_| true }
+    ok = NetGuard::Checks::Result.new('public_ip', true, 'ok', true, '203.0.113.7')
+    NetGuard::System.stub(:root?, true) do
+      NetGuard::System.stub(:pf_enabled?, false) do
+        NetGuard::Checks.stub(:public_ip, ok) do
+          firewall.enable!(confirmation: 'ENABLE NETGUARD')
+        end
+      end
+    end
+    assert_equal '203.0.113.7', firewall.state['locked_exit_ip']
+    assert_equal '203.0.113.7', firewall.expected_exit_ip
+  end
+
+  def test_watch_without_enable_exits_cleanly
+    env = { 'NETGUARD_HOME' => @tmp }
+    out, _, status = Open3.capture3(env, RbConfig.ruby, File.expand_path('../bin/netguard', __dir__), 'watch')
+    assert status.success?
+    assert_includes out.force_encoding('UTF-8'), '未启用'
+  end
+
+  def test_verge_runtime_path_lookup
+    assert_nil NetGuard::Config.verge_runtime_path(@tmp)
+    path = File.join(@tmp, NetGuard::Config::VERGE_RUNTIME)
+    FileUtils.mkdir_p(File.dirname(path))
+    File.write(path, 'proxies: []')
+    assert_equal path, NetGuard::Config.verge_runtime_path(@tmp)
   end
 end

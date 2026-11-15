@@ -56,17 +56,21 @@ module NetGuard
     def configure(argv)
       options = {}
       OptionParser.new do |o|
-        o.on('--from PATH', '从 Clash YAML 仅导入 server/port') { |v| options[:from] = v }
+        o.on('--from PATH', '从 Clash YAML 仅导入 server/port；auto = Clash Verge 运行配置') { |v| options[:from] = v }
         o.on('--tun NAME') { |v| options[:tun_interface] = v }
         o.on('--timezone ZONE') { |v| options[:expected_timezone] = v }
         o.on('--language LANG') { |v| options[:expected_language] = v }
         o.on('--expected-ip IP') { |v| options[:expected_ip] = v }
         o.on('--no-lan') { options[:allow_lan] = false }
       end.parse!(argv)
-      count = config.import_clash(File.expand_path(options[:from])) if options[:from]
+if options[:from] == 'auto'
+  options[:from] = Config.verge_runtime_path or raise ArgumentError, '没有找到 Clash Verge 运行配置（clash-verge.yaml）；请用 --from 指定 YAML'
+end
+count = config.import_clash(File.expand_path(options[:from])) if options[:from]
       updates = options.reject { |k, _| k == :from }
       config.update(updates)
       puts "已保存配置：#{config.path}"
+      puts "Clash 配置来源：#{config.data['clash_config']}（监控会跟随其变化）" if count
       if count
         puts "已导入 #{count} 个端点（未保存 UUID、密码或订阅内容）。"
         dns = config.data['bootstrap_dns'].map { |d| "#{d['scheme']}://#{d['ip']}:#{d['port']}" }
@@ -96,8 +100,9 @@ module NetGuard
       puts '立即运行 bin/netguard check --browser，并保留 sudo bin/netguard recovery 作为恢复入口。'
     end
 
-    def recovery
-      firewall.disable!
+def recovery
+  stop_monitor_service if System.root?
+  firewall.disable!
       puts 'NetGuard anchor 和托管配置已移除，其他网络设置未被重置。'
     end
 
@@ -111,7 +116,7 @@ module NetGuard
       results = if preflight
                   [Checks.public_ip(config.data), Checks.timezone_check(config.data), Checks.language_check(config.data)]
                 else
-                  Checks.all(config.data)
+                  Checks.all(config.data.merge('expected_ip' => firewall.expected_exit_ip))
                 end
       results.concat(BrowserCheck.new(config, File.join(ROOT, 'web')).run) if browser
       results.each { |r| puts "#{r.ok ? 'PASS' : 'FAIL'} #{r.name}: #{r.detail}" }
@@ -119,28 +124,62 @@ module NetGuard
       raise RuntimeError, '存在关键网络检查失败；请保持锁网并排查' if critical_failure
     end
 
-    def watch
-      raise SecurityError, '请先完成 enable，再启动监控' unless firewall.state['enabled_at']
+MONITOR_LABEL = 'com.netguard.monitor'
+MONITOR_PLIST = "/Library/LaunchDaemons/#{MONITOR_LABEL}.plist"
+
+# Recovery must stop the self-healing monitor first, or it would re-apply PF.
+def stop_monitor_service
+  System.run('/bin/launchctl', 'bootout', "system/#{MONITOR_LABEL}")
+  File.delete(MONITOR_PLIST) if File.file?(MONITOR_PLIST)
+rescue StandardError
+  nil
+end
+
+def watch
+  unless firewall.state['enabled_at']
+    puts 'NetGuard 未启用，监控不运行。'
+    return
+  end
       puts '监控已启动；网络异常只会保持 LOCKED，不会自动关闭 PF。Ctrl-C 停止监控不会关闭防火墙。'
       Monitor.new(config, firewall).run
     end
 
-    def status
-      health_path = File.join(config.home, 'health.json')
-      health = File.file?(health_path) ? JSON.parse(File.read(health_path)) : {}
-      puts "NetGuard 配置：#{firewall.state['enabled_at'] ? '已启用' : '未启用或已恢复'}"
-      puts "PF：#{System.pf_enabled? ? '已启用' : '未启用或不可读'}"
-      puts "TUN：#{System.detect_tun(config.data['tun_interface']) || '未检测到'}"
-      puts "健康状态：#{health['healthy'] == true ? '正常' : '锁定/未知'}"
-      puts "最近检查：#{health['checked_at'] || '无'}"
-      puts "最近结果：#{health['detail'] || '无'}"
-    end
+def status
+  health_path = File.join(config.home, 'health.json')
+  health = File.file?(health_path) ? JSON.parse(File.read(health_path)) : {}
+  enabled = firewall.state['enabled_at']
+  puts "NetGuard 配置：#{enabled ? '已启用' : '未启用或已恢复'}"
+  puts "PF：#{pf_line(health, enabled)}"
+  puts "TUN：#{System.detect_tun(config.data['tun_interface']) || '未检测到'}"
+  puts "健康状态：#{health['healthy'] == true ? '正常' : '锁定/未知'}"
+  puts "出口锁定：#{exit_line(health)}" if enabled
+  puts "自愈次数：#{health['heals'] || 0}#{health.dig('last_heal', 'at') ? "（最近 #{health.dig('last_heal', 'at')}：#{Array(health.dig('last_heal', 'problems')).join('、')}）" : ''}" if enabled
+  puts "Clash 配置：#{config.data['clash_config'] || '未记录'}#{health['clash_reloaded_at'] ? "（#{health['clash_reloaded_at']} 自动重新导入）" : ''}"
+  puts "最近检查：#{health['checked_at'] || '无'}"
+  puts "最近结果：#{health['detail'] || '无'}"
+end
+
+# Non-root cannot query PF, so prefer what the root monitor last observed.
+def pf_line(health, enabled)
+  if System.root? || !enabled || !health['pf']
+    return System.pf_enabled? ? '已启用' : (System.root? ? '未启用' : '未启用或不可读')
+  end
+  problems = Array(health['pf_problems'])
+  problems.empty? ? '保护完整（监控确认）' : "异常：#{problems.join('、')}"
+end
+
+def exit_line(health)
+  expected = health['expected_exit_ip'] || firewall.expected_exit_ip
+  return '未锁定' unless expected
+  return "#{expected}（变化！当前 #{health['exit_ip']}）" if health['exit_mismatch']
+  "#{expected}（一致）"
+end
 
     def help
       puts <<~HELP
         NetGuard #{VERSION} — macOS 主机 fail-closed 网络锁
         doctor                       只读检查环境
-        configure --from FILE        仅导入代理 server/port
+        configure --from FILE|auto   仅导入代理 server/port（auto = Clash Verge 运行配置）
         plan                         显示将要生成的 PF 规则
         enable --apply               实际启用（需要 sudo 和二次输入）
         check [--preflight] [--browser]  启用前预检或启用后完整网络检查

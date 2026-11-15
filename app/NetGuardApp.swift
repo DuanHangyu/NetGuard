@@ -32,6 +32,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isProtected = false
     private var monitorRunning = false
     private var sourceYAML: String?
+    private var lastAlertKey: String?
+    private var lastHealCount: Int?
+
+    private var vergeRuntimePath: String {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml").path
+    }
 
     private var cliPath: String {
         resourceRoot.appendingPathComponent("netguard/bin/netguard").path
@@ -48,11 +55,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildMainMenu()
         buildWindow()
-        if defaults.string(forKey: "sourceYAML") == nil {
-            let known = "/Users/qing/Downloads/RESIP纯净住宅IP.yaml"
-            if FileManager.default.fileExists(atPath: known) {
-                defaults.set(known, forKey: "sourceYAML")
-            }
+        // Follow Clash Verge's live runtime config unless the user picked a file by hand,
+        // so subscription updates and profile switches are picked up automatically.
+        if !defaults.bool(forKey: "sourceYAMLChosenByUser"),
+           FileManager.default.fileExists(atPath: vergeRuntimePath) {
+            defaults.set(vergeRuntimePath, forKey: "sourceYAML")
         }
         sourceYAML = defaults.string(forKey: "sourceYAML")
         updateConfigLabel()
@@ -212,7 +219,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             configLabel.toolTip = nil
             return
         }
-        configLabel.stringValue = URL(fileURLWithPath: path).lastPathComponent
+        configLabel.stringValue = path == vergeRuntimePath
+            ? "Clash Verge 当前运行配置（自动跟随）"
+            : URL(fileURLWithPath: path).lastPathComponent
         configLabel.toolTip = path
     }
 
@@ -230,6 +239,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard panel.runModal() == .OK, let url = panel.url else { return }
         sourceYAML = url.path
         defaults.set(url.path, forKey: "sourceYAML")
+        defaults.set(url.path != vergeRuntimePath, forKey: "sourceYAMLChosenByUser")
         updateConfigLabel()
         appendLog("已选择配置：\(url.path)。尚未写入或启用任何保护。")
     }
@@ -430,16 +440,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let tun = value(after: "TUN：", in: output) ?? "未知"
         let recent = value(after: "最近结果：", in: output) ?? "暂无"
         let healthy = output.contains("健康状态：正常")
+        let pf = value(after: "PF：", in: output) ?? "未知"
+        let exitLock = value(after: "出口锁定：", in: output) ?? "未锁定"
+        let exitChanged = exitLock.contains("变化")
+        let pfBroken = pf.hasPrefix("异常")
+        let heals = Int((value(after: "自愈次数：", in: output) ?? "0").prefix { $0.isNumber }) ?? 0
 
         if isProtected {
-            if healthy {
+            if exitChanged {
+                statusDot.textColor = .systemRed
+                statusLabel.stringValue = "警告：出口 IP 发生变化"
+            } else if pfBroken {
+                statusDot.textColor = .systemRed
+                statusLabel.stringValue = "警告：防火墙保护被改动，正在自愈"
+            } else if healthy {
                 statusDot.textColor = .systemGreen
                 statusLabel.stringValue = "保护运行中"
             } else {
                 statusDot.textColor = .systemOrange
                 statusLabel.stringValue = "保护已开启 · 正在确认代理状态"
             }
-            statusDetail.stringValue = "TUN：\(tun)  ·  后台监控：\(monitor ? "运行中" : "未运行或不可读")\n\(recent)"
+            statusDetail.stringValue = "出口锁定：\(exitLock)  ·  PF：\(pf)  ·  自愈 \(heals) 次\n" +
+                "TUN：\(tun)  ·  后台监控：\(monitor ? "运行中" : "未运行或不可读")  ·  \(recent)"
+            alertIfNeeded(exitChanged: exitChanged, exitLock: exitLock, pfBroken: pfBroken, pf: pf,
+                          healthy: healthy, recent: recent, heals: heals)
             startButton.title = monitor ? "保护已开启" : "修复保护并重启监控"
             startButton.isEnabled = !monitor
         } else {
@@ -450,6 +474,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             startButton.isEnabled = true
         }
         stopButton.isEnabled = isProtected
+    }
+
+    // One system notification per distinct problem; nothing while healthy.
+    private func alertIfNeeded(exitChanged: Bool, exitLock: String, pfBroken: Bool, pf: String,
+                               healthy: Bool, recent: String, heals: Int) {
+        if let last = lastHealCount, heals > last {
+            notify("NetGuard 已自愈", "防火墙保护曾被改动或关闭，已自动恢复锁网（第 \(heals) 次）。")
+        }
+        lastHealCount = heals
+        let key: String?
+        if exitChanged {
+            key = "exit:\(exitLock)"
+            if key != lastAlertKey { notify("出口 IP 发生变化", "锁定出口：\(exitLock)。请检查 Clash 节点或规则。") }
+        } else if pfBroken {
+            key = "pf:\(pf)"
+            if key != lastAlertKey { notify("防火墙保护被改动", "\(pf)。后台监控正在自动恢复。") }
+        } else if !healthy && recent != "无" && recent != "暂无" {
+            key = "locked"
+            if key != lastAlertKey { notify("NetGuard 保持锁网", "代理暂不可用：\(recent)") }
+        } else {
+            key = nil
+        }
+        if key != nil { appendLog("提醒：\(statusLabel.stringValue)") }
+        lastAlertKey = key
+    }
+
+    private func notify(_ title: String, _ body: String) {
+        let escape = { (s: String) in s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") }
+        let script = "display notification \"\(escape(body))\" with title \"\(escape(title))\" sound name \"Basso\""
+        workQueue.async { _ = self.process("/usr/bin/osascript", ["-e", script]) }
     }
 
     private func value(after prefix: String, in text: String) -> String? {

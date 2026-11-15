@@ -1,4 +1,4 @@
-# NetGuard 0.2.1
+# NetGuard 0.3.0
 
 NetGuard 是 macOS 主机上的 fail-closed 网络锁：复用 Clash/Mihomo TUN，以 PF 防火墙兜底。代理或 TUN 失效时，保持断网而不是自动恢复家庭宽带直连。
 
@@ -10,7 +10,7 @@ NetGuard 是 macOS 主机上的 fail-closed 网络锁：复用 Clash/Mihomo TUN�
 
 1. 在 Clash Verge 中连接可用节点，并保持 **TUN 模式开启**。
 2. 打开 `/Applications/NetGuard.app`。
-3. 确认窗口中的 YAML 与 Clash 当前配置一致；第一次可点“选择 YAML…”更换。
+3. 窗口默认读取 **Clash Verge 当前运行配置**（自动跟随订阅更新和配置切换），一般无需选择；只有使用其他客户端时才点“选择 YAML…”。
 4. 点击 **“一键启动保护”**，在 macOS 系统窗口中输入管理员密码。
 5. 看到“保护运行中”即可。需要浏览器证据时，再点“检查环境”，会打开 Chrome 本地诊断页。
 
@@ -20,9 +20,9 @@ NetGuard 是 macOS 主机上的 fail-closed 网络锁：复用 Clash/Mihomo TUN�
 
 - 从所选 Clash YAML 仅导入代理 `server`、`port` 和传输协议；不保存 UUID、密码或订阅全文。
 - 检查 TUN 和代理端点，生成并审查 PF 规则。
-- 检查当前代理出口，失败时不启用。
+- 检查当前代理出口，失败时不启用；成功时**锁定这个出口 IP**，之后出口一旦变化就告警。
 - 备份 `/etc/pf.conf`，加载 NetGuard 的 PF anchor。
-- 安装并启动 `com.netguard.monitor` 后台监控，适配 TUN 变化；异常只保持锁网，绝不自动关闭 PF。
+- 安装并启动 `com.netguard.monitor` 后台监控：自愈防火墙、跟随 Clash 配置、适配 TUN 和节点 IP 变化、核对出口 IP；异常只保持锁网，绝不自动关闭 PF。
 - 检查终端出口、物理网卡直连、公共 DNS 和 IPv6。
 
 浏览器语言和时区检查由“检查环境”按钮单独触发，避免每次启动都等待浏览器页面。
@@ -49,19 +49,23 @@ sudo /Users/qing/Projects/NetGuard/bin/netguard-recovery
 
 不要为了恢复而盲目执行 `pfctl -F all`，那可能影响其他防火墙使用方。
 
-### 后台监控与开机保护的区别
+### 后台监控（含自愈与开机保护）
 
-启用时安装的是 `/Library/LaunchDaemons/com.netguard.monitor.plist`，停止时移除。它用于后台健康检查和 TUN 适配，**不等同于已经完成开机早期锁网验证**。
+启用时安装 `/Library/LaunchDaemons/com.netguard.monitor.plist`（root、开机自动运行），停止时移除。每个周期（默认 20 秒）依次：
 
-`service/com.netguard.boot.plist` 仍只是 boot-lock 模板，图形应用不会自动安装它。重启后应打开应用检查状态，不要默认重启全过程都已受到保护。
+1. **自愈**：确认 PF 已启用、主规则集引用了 NetGuard anchor、anchor 内有规则、`/etc/pf.conf` 仍有托管行。任何一项被其他软件、系统更新或 `pfctl -d` 改掉，都会立即用上次的规则重新锁网，并在窗口和系统通知中提示。
+2. **跟随 Clash 配置**：Clash Verge 运行配置变化（订阅更新、切换配置）时，重新导入节点和引导 DNS；配置读取失败时保留上一份。
+3. **更新规则**：TUN 或节点 IP 变化时重新加载 PF。
+4. **核对出口**：出口 IP 与启用时锁定的地址不同就告警（只告警，不额外断网）。想换出口时，停止后重新启动保护即可重新锁定；也可用 `configure --expected-ip` 指定。
 
+**开机保护**：监控随系统启动运行，第一步就是自愈，用上次的规则锁网，不依赖 DNS 或网络。因此重启后无需打开应用，保护会自动恢复。启动早期在 launchd 拉起监控之前仍有极短窗口，这是用户态程序的限制。
 ## 能做什么
 
 - 仅允许 TUN、指定代理端点、回环及可选局域网流量；其他出站流量默认阻断。
 - DNS/DoT 阻断规则先于局域网放行，IPv6 仅能通过已批准的 TUN。
 - 分别检查终端出口、物理接口直连、公共 DNS、IPv6、系统时区和 Chrome 语言。
 - 本地浏览器页面回传 JS 实际读取到的语言和时区，不收集 Cookie 或历史。
-- 监控只保持锁网和适配 TUN 变化，绝不因代理故障自动关闭防火墙。
+- 监控自愈防火墙、开机即锁网、锁定并核对出口 IP、跟随 Clash 配置变化，绝不因代理故障自动关闭防火墙。
 - 提供不依赖 DNS 或外网的本地恢复入口。
 
 ## 重要边界
@@ -128,7 +132,7 @@ sudo bin/netguard-recovery
 - `enable --apply`：备份 `/etc/pf.conf`，安装 anchor，并要求二次确认。
 - `check --preflight [--browser]`：启用前检查代理和环境，不要求直连已经阻断。
 - `check [--browser]`：启用后运行完整主机及可选浏览器检查。
-- `watch`：故障监控；Ctrl-C 只停止监控，不关闭防火墙。
+- `watch`：故障监控与自愈（通常由后台服务运行）；Ctrl-C 只停止监控，不关闭防火墙。
 - `status`：查看锁网与健康状态。
 - `recovery`：移除 NetGuard anchor 和托管配置，不重置 Clash 节点或浏览器。
 

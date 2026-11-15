@@ -56,7 +56,9 @@ create_monitor_plist() {
   /usr/bin/plutil -insert EnvironmentVariables.LC_ALL -string en_US.UTF-8 "$destination" || return 1
   /usr/bin/plutil -insert EnvironmentVariables.LANG -string en_US.UTF-8 "$destination" || return 1
   /usr/bin/plutil -insert RunAtLoad -bool YES "$destination" || return 1
-  /usr/bin/plutil -insert KeepAlive -bool YES "$destination" || return 1
+  # Restart on crash, but not after a clean exit (monitor exits once protection is stopped).
+  /usr/bin/plutil -insert KeepAlive -dictionary "$destination" || return 1
+  /usr/bin/plutil -insert KeepAlive.SuccessfulExit -bool NO "$destination" || return 1
   /usr/bin/plutil -insert ThrottleInterval -integer 5 "$destination" || return 1
   /usr/bin/plutil -insert StandardOutPath -string "$NETGUARD_HOME/watch.log" "$destination" || return 1
   /usr/bin/plutil -insert StandardErrorPath -string "$NETGUARD_HOME/watch.log" "$destination" || return 1

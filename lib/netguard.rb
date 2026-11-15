@@ -9,6 +9,6 @@ require_relative 'netguard/monitor'
 require_relative 'netguard/cli'
 
 module NetGuard
-  VERSION = '0.2.1'
+  VERSION = '0.3.0'
   ROOT = File.expand_path('..', __dir__)
 end

@@ -15,7 +15,8 @@ module NetGuard
       'check_url' => 'https://api.ipify.org',
       'check_interval' => 20,
       'proxy_endpoints' => [],
-      'bootstrap_dns' => []
+      'bootstrap_dns' => [],
+      'clash_config' => nil
     }.freeze
 
     attr_reader :home, :path, :data
@@ -26,13 +27,30 @@ module NetGuard
       @data = DEFAULTS.merge(File.file?(@path) ? YAML.safe_load(File.read(@path)) : {})
     end
 
+    # The long-running monitor re-reads the file so CLI/GUI changes take effect.
+    def reload!
+      @data = DEFAULTS.merge(File.file?(@path) ? YAML.safe_load(File.read(@path)) : {})
+    rescue StandardError
+      @data
+    end
+
     def save
       FileUtils.mkdir_p(@home)
       File.write(@path, YAML.dump(@data))
       File.chmod(0o600, @path)
     end
 
-    def import_clash(path)
+    # Clash Verge Rev writes the merged runtime config (active profile + Merge/Script)
+    # here and regenerates it on every subscription update or profile switch.
+    VERGE_RUNTIME = 'Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml'
+
+    def self.verge_runtime_path(home = System.user_home)
+      path = File.join(home, VERGE_RUNTIME)
+      File.file?(path) ? path : nil
+    end
+
+    # Pure extraction: only server/port/transport and literal bootstrap DNS.
+    def self.extract_clash(path)
       parsed = YAML.safe_load(File.read(path))
       proxies = parsed.is_a?(Hash) ? parsed['proxies'] : nil
       raise ArgumentError, 'YAML 中没有 proxies 数组' unless proxies.is_a?(Array)
@@ -42,9 +60,22 @@ module NetGuard
         { 'host' => proxy['server'].to_s, 'port' => Integer(proxy['port']), 'protocol' => transport }
       end.compact.uniq
       raise ArgumentError, '没有找到可用代理端点' if endpoints.empty?
-      @data['proxy_endpoints'] = endpoints
-      @data['bootstrap_dns'], @skipped_dns = self.class.bootstrap_dns_from(parsed['dns'])
-      endpoints.length
+      bootstrap, skipped = bootstrap_dns_from(parsed['dns'])
+      { 'proxy_endpoints' => endpoints, 'bootstrap_dns' => bootstrap, 'skipped_dns' => skipped }
+    end
+
+    def import_clash(path)
+      extracted = self.class.extract_clash(path)
+      @data['proxy_endpoints'] = extracted['proxy_endpoints']
+      @data['bootstrap_dns'] = extracted['bootstrap_dns']
+      @data['clash_config'] = File.expand_path(path)
+      @skipped_dns = extracted['skipped_dns']
+      extracted['proxy_endpoints'].length
+    end
+
+    # True when the endpoint-relevant parts of the Clash config differ from ours.
+    def clash_changed?(extracted)
+      extracted['proxy_endpoints'] != @data['proxy_endpoints'] || extracted['bootstrap_dns'] != @data['bootstrap_dns']
     end
 
     # Entries that could not be turned into a PF rule (domains, IPv6, dhcp://, system).
