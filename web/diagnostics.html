@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NetGuard Browser Check</title>
+<style>body{font:16px/1.6 -apple-system,sans-serif;max-width:760px;margin:48px auto;padding:0 20px;background:#10141b;color:#e9eef5}main{background:#19212c;padding:28px;border-radius:16px}code{color:#8fd3ff}#status{font-weight:600}</style>
+<main><h1>NetGuard 浏览器检查</h1><p>本页面仅向 <code>127.0.0.1</code> 报告语言、时区和平台，不收集 Cookie、浏览历史或表单内容。</p><pre id="result">正在读取…</pre><p id="status">正在报告给本机 NetGuard…</p></main>
+<script>
+const report={languages:navigator.languages||[navigator.language],timezone:Intl.DateTimeFormat().resolvedOptions().timeZone,platform:navigator.platform,reportedAt:new Date().toISOString()};
+document.querySelector('#result').textContent=JSON.stringify(report,null,2);
+fetch('/report',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(report)}).then(()=>{document.querySelector('#status').textContent='✓ 已报告，可以回到终端查看结果。';}).catch(e=>{document.querySelector('#status').textContent='报告失败：'+e;});
+</script></html>

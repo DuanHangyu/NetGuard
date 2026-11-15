@@ -1,0 +1,117 @@
+#!/bin/zsh
+# Runs only after the user approves macOS's administrator authorization prompt.
+# No password is collected or stored by NetGuard.
+set -u
+set -o pipefail
+umask 022
+
+ACTION="${1:-}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+BACKEND_ROOT="$SCRIPT_DIR/netguard"
+CLI="$BACKEND_ROOT/bin/netguard"
+RUBY="/usr/bin/ruby"
+LABEL="com.netguard.monitor"
+SERVICE="system/$LABEL"
+PLIST="/Library/LaunchDaemons/$LABEL.plist"
+
+if [[ "$(id -u)" -ne 0 ]]; then
+  print -u2 "错误：此辅助程序只能由 NetGuard 通过 macOS 管理员授权运行。"
+  exit 77
+fi
+if [[ -z "${NETGUARD_HOME:-}" || "$NETGUARD_HOME" != */.netguard ]]; then
+  print -u2 "错误：NETGUARD_HOME 必须是用户目录下的 .netguard。"
+  exit 78
+fi
+if [[ ! -x "$CLI" ]]; then
+  print -u2 "错误：应用内的 NetGuard 后端不存在：$CLI"
+  exit 79
+fi
+
+export LC_ALL="en_US.UTF-8"
+export LANG="en_US.UTF-8"
+
+make_files_user_readable() {
+  # enable/recovery may be run by root. Keep the CLI status readable by the user
+  # without making the endpoint-only config world-readable.
+  if [[ -d "$NETGUARD_HOME" ]]; then
+    local owner
+    owner="$(/usr/bin/stat -f '%u:%g' "$NETGUARD_HOME")"
+    [[ -f "$NETGUARD_HOME/state.yml" ]] && /usr/sbin/chown "$owner" "$NETGUARD_HOME/state.yml"
+    [[ -f "$NETGUARD_HOME/endpoint-cache.yml" ]] && /usr/sbin/chown "$owner" "$NETGUARD_HOME/endpoint-cache.yml"
+    return 0
+  fi
+}
+
+create_monitor_plist() {
+  local destination="$1"
+  /bin/rm -f "$destination"
+  /usr/bin/plutil -create xml1 "$destination" || return 1
+  /usr/bin/plutil -insert Label -string "$LABEL" "$destination" || return 1
+  /usr/bin/plutil -insert ProgramArguments -array "$destination" || return 1
+  /usr/bin/plutil -insert ProgramArguments.0 -string "$RUBY" "$destination" || return 1
+  /usr/bin/plutil -insert ProgramArguments.1 -string "$CLI" "$destination" || return 1
+  /usr/bin/plutil -insert ProgramArguments.2 -string watch "$destination" || return 1
+  /usr/bin/plutil -insert EnvironmentVariables -dictionary "$destination" || return 1
+  /usr/bin/plutil -insert EnvironmentVariables.NETGUARD_HOME -string "$NETGUARD_HOME" "$destination" || return 1
+  /usr/bin/plutil -insert EnvironmentVariables.LC_ALL -string en_US.UTF-8 "$destination" || return 1
+  /usr/bin/plutil -insert EnvironmentVariables.LANG -string en_US.UTF-8 "$destination" || return 1
+  /usr/bin/plutil -insert RunAtLoad -bool YES "$destination" || return 1
+  /usr/bin/plutil -insert KeepAlive -bool YES "$destination" || return 1
+  /usr/bin/plutil -insert ThrottleInterval -integer 5 "$destination" || return 1
+  /usr/bin/plutil -insert StandardOutPath -string "$NETGUARD_HOME/watch.log" "$destination" || return 1
+  /usr/bin/plutil -insert StandardErrorPath -string "$NETGUARD_HOME/watch.log" "$destination" || return 1
+  /usr/bin/plutil -lint "$destination" || return 1
+}
+
+install_and_start_monitor() {
+  local temporary="/Library/LaunchDaemons/.com.netguard.monitor.plist.$$"
+  trap '/bin/rm -f "$temporary"' EXIT
+  create_monitor_plist "$temporary" || return 1
+  /usr/sbin/chown root:wheel "$temporary" || return 1
+  /bin/chmod 0644 "$temporary" || return 1
+  /bin/mv "$temporary" "$PLIST" || return 1
+  trap - EXIT
+
+  /bin/launchctl bootout "$SERVICE" >/dev/null 2>&1 || true
+  if ! /bin/launchctl bootstrap system "$PLIST"; then
+    print -u2 "PF 保护仍保持启用，但后台监控服务注册失败。"
+    return 1
+  fi
+  if ! /bin/launchctl kickstart -k "$SERVICE"; then
+    print -u2 "PF 保护仍保持启用，但后台监控服务启动失败。"
+    return 1
+  fi
+  print "后台监控已启动；代理异常只会保持锁网，不会自动关闭 PF。"
+}
+
+case "$ACTION" in
+  enable)
+    # The GUI button and macOS administrator prompt are the user's confirmation.
+    # Keep the CLI's original second-confirmation safety check intact.
+    "$RUBY" "$CLI" enable --apply <<< 'ENABLE NETGUARD'
+    enable_status=$?
+    make_files_user_readable
+    if [[ $enable_status -ne 0 ]]; then
+      exit $enable_status
+    fi
+    # A monitor failure must never trigger an automatic firewall disable.
+    install_and_start_monitor || exit $?
+    print "NetGuard 一键启动流程完成。"
+    ;;
+  disable)
+    /bin/launchctl bootout "$SERVICE" >/dev/null 2>&1 || true
+    /bin/rm -f "$PLIST"
+    "$RUBY" "$CLI" recovery
+    recovery_status=$?
+    make_files_user_readable
+    if [[ $recovery_status -ne 0 ]]; then
+      exit $recovery_status
+    fi
+    /bin/rm -f "$NETGUARD_HOME/health.json"
+    print "NetGuard 后台监控和 PF 托管规则已移除；Clash 与系统代理未修改。"
+    ;;
+  *)
+    print -u2 "用法：netguard-gui-helper enable|disable（仅限 macOS 管理员授权后运行）"
+    exit 64
+    ;;
+esac
