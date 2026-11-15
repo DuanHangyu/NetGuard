@@ -51,7 +51,8 @@ module NetGuard
 
     # Pure extraction: only server/port/transport and literal bootstrap DNS.
     def self.extract_clash(path)
-      parsed = YAML.safe_load(File.read(path))
+      # Real Clash Verge runtime files contain :symbol-like scalars and anchors/aliases.
+      parsed = YAML.safe_load(File.read(path), permitted_classes: [Symbol], aliases: true)
       proxies = parsed.is_a?(Hash) ? parsed['proxies'] : nil
       raise ArgumentError, 'YAML 中没有 proxies 数组' unless proxies.is_a?(Array)
       endpoints = proxies.map do |proxy|

@@ -361,4 +361,17 @@ class NetGuardTest < Minitest::Test
   ensure
     FileUtils.rm_rf(File.join(File.dirname(@tmp), 'Library')) if created
   end
+  def test_extract_clash_accepts_symbols_and_aliases_like_verge_runtime
+    path = File.join(@tmp, 'runtime.yaml')
+    File.write(path, <<~YAML)
+      mode: :rule
+      base: &node {type: vless, port: 443}
+      proxies:
+        - <<: *node
+          name: a
+          server: 203.0.113.60
+    YAML
+    extracted = NetGuard::Config.extract_clash(path)
+    assert_equal [{ 'host' => '203.0.113.60', 'port' => 443, 'protocol' => 'tcp' }], extracted['proxy_endpoints']
+  end
 end
