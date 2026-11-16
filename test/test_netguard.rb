@@ -212,6 +212,17 @@ class NetGuardTest < Minitest::Test
     refute NetGuard::Leak.exposes_real_ip?('192.168.1.5', '66.1.2.3', locals)
   end
 
+  def test_language_check_passes_when_chrome_prefs_unreadable
+    NetGuard::System.stub(:chrome_languages, []) do
+      r = NetGuard::Checks.language_check('expected_language' => 'en-US')
+      assert r.ok
+      assert_includes r.detail, '不可读'
+    end
+    NetGuard::System.stub(:chrome_languages, ['zh-CN']) do
+      refute NetGuard::Checks.language_check('expected_language' => 'en-US').ok
+    end
+  end
+
   def test_system_dns_check_recognises_clash_fake_ip
     fake = [Addrinfo.tcp('198.18.0.12', 443)]
     Addrinfo.stub(:getaddrinfo, fake) { assert NetGuard::Checks.system_dns_check.ok? }

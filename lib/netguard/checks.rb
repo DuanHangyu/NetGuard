@@ -96,6 +96,11 @@ module NetGuard
     def self.language_check(config)
       languages = System.chrome_languages
       expected = config['expected_language']
+      if languages.empty?
+        # macOS privacy (TCC) often blocks reading Chrome's profile; the browser
+        # check (--browser) reports the real navigator.languages instead.
+        return Result.new('chrome_language', true, "Chrome 语言：设置文件不可读（macOS 隐私限制），以 --browser 实测为准", false)
+      end
       Result.new('chrome_language', languages.first == expected, "Chrome 语言：#{languages.join(',')}（期望首位 #{expected}）", false)
     end
   end
