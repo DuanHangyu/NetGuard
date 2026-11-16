@@ -374,4 +374,134 @@ class NetGuardTest < Minitest::Test
     extracted = NetGuard::Config.extract_clash(path)
     assert_equal [{ 'host' => '203.0.113.60', 'port' => 443, 'protocol' => 'tcp' }], extracted['proxy_endpoints']
   end
+
+  # --- 国内直连 (geoip.dat CN table) ---
+
+  def pb_varint(n)
+    out = +''
+    loop do
+      byte = n & 0x7f
+      n >>= 7
+      out << (n.zero? ? byte : byte | 0x80).chr
+      return out.b if n.zero?
+    end
+  end
+
+  def pb_bytes(field, payload)
+    (pb_varint((field << 3) | 2) + pb_varint(payload.bytesize) + payload.b).b
+  end
+
+  def pb_geoip(code, cidrs, reverse: false)
+    body = pb_bytes(1, code)
+    cidrs.each do |ip, prefix|
+      raw = ip.include?(':') ? IPAddr.new(ip).hton : ip.split('.').map(&:to_i).pack('C4')
+      body << pb_bytes(2, pb_bytes(1, raw) + pb_varint(2 << 3) + pb_varint(prefix))
+    end
+    body << pb_varint(3 << 3) + pb_varint(1) if reverse
+    pb_bytes(1, body)
+  end
+
+  def write_geoip(entries)
+    path = File.join(@tmp, 'geoip.dat')
+    File.binwrite(path, entries.join)
+    path
+  end
+
+  def test_geoip_reads_only_the_requested_country_ipv4
+    path = write_geoip([pb_geoip('US', [['8.8.8.0', 24]]),
+                        pb_geoip('CN', [['223.5.5.0', 24], ['1.0.1.7', 24], ['240e::', 20], ['0.0.0.0', 1]])])
+    assert_equal ['223.5.5.0/24', '1.0.1.0/24'], NetGuard::GeoIP.ipv4_cidrs(path, 'cn'),
+                 'IPv6 and overly wide (<8) prefixes must be dropped, host bits masked'
+    assert_raises(ArgumentError) { NetGuard::GeoIP.ipv4_cidrs(path, 'JP') }
+    reversed = write_geoip([pb_geoip('CN', [['1.0.1.0', 24]], reverse: true)])
+    assert_raises(ArgumentError) { NetGuard::GeoIP.ipv4_cidrs(reversed, 'CN') }
+    File.binwrite(path, "\x0a\xff\x01".b)
+    assert_raises(ArgumentError) { NetGuard::GeoIP.ipv4_cidrs(path, 'CN') }
+  end
+
+  def cn_firewall(cidrs)
+    firewall = NetGuard::Firewall.new(@config)
+    firewall.define_singleton_method(:cn_direct_cidrs) { cidrs }
+    firewall
+  end
+
+  def test_cn_direct_is_off_by_default_and_never_in_lock_only
+    rules = NetGuard::Firewall.new(@config).render([{ 'ip' => '203.0.113.5', 'port' => 443 }], 'utun6')
+    refute_includes rules, 'netguard_cn'
+    @config.data['allow_cn_direct'] = true
+    firewall = NetGuard::Firewall.new(@config)
+    firewall.define_singleton_method(:cn_direct_cidrs) { raise 'must not be consulted without TUN' }
+    refute_includes firewall.render([{ 'ip' => '203.0.113.5', 'port' => 443 }], nil), 'netguard_cn'
+  end
+
+  def test_cn_direct_table_follows_dns_block_and_precedes_block_all
+    @config.data['allow_cn_direct'] = true
+    rules = cn_firewall(['1.0.1.0/24', '223.5.5.0/24']).render([{ 'ip' => '203.0.113.5', 'port' => 443 }], 'utun6')
+    lines = rules.lines.map(&:strip)
+    table = lines.index('table <netguard_cn> persist file "/etc/pf.anchors/com.netguard.cn"')
+    pass = lines.index('pass out quick inet from any to <netguard_cn> flags any no state')
+    dns = lines.index { |l| l.include?('port { 53, 853 }') }
+    assert table && pass && dns
+    assert table < lines.index { |l| l.start_with?('pass', 'block') }, 'table must be declared before any rule'
+    assert dns < pass, 'plain DNS to mainland resolvers must stay blocked'
+    assert pass < lines.index('block out quick inet6 all')
+    assert_equal 'block out all', lines.last
+    assert_match(/\A# cn-direct 2 ranges sha256:\h{16}\z/, lines[1])
+  end
+
+  def test_cn_direct_without_geoip_warns_and_allows_nothing
+    @config.data['allow_cn_direct'] = true
+    firewall = NetGuard::Firewall.new(@config)
+    assert_nil firewall.cn_direct_cidrs
+    assert(firewall.warnings.any? { |w| w.include?('geoip.dat') })
+    refute_includes firewall.render([{ 'ip' => '203.0.113.5', 'port' => 443 }], 'utun6'), 'netguard_cn'
+  end
+
+  def test_cn_direct_reads_verge_geoip_under_user_home
+    home = File.join(@tmp, 'user')
+    dir = File.join(home, File.dirname(NetGuard::Config::VERGE_RUNTIME))
+    FileUtils.mkdir_p(dir)
+    cidrs = (1..1200).map { |i| ["10.#{i / 256}.#{i % 256}.0", 24] }
+    File.binwrite(File.join(dir, 'geoip.dat'), pb_geoip('CN', cidrs))
+    config = NetGuard::Config.new(File.join(home, '.netguard'))
+    config.data['allow_cn_direct'] = true
+    firewall = NetGuard::Firewall.new(config)
+    assert_equal 1200, firewall.cn_direct_cidrs.length
+    assert_includes firewall.cn_direct_summary, '1200'
+  end
+
+  def test_install_writes_table_or_drops_cn_rules_to_keep_pf_loadable
+    @config.data['allow_cn_direct'] = true
+    table = File.join(@tmp, 'cn.table')
+    rules = cn_firewall(['1.0.1.0/24']).render([{ 'ip' => '203.0.113.5', 'port' => 443 }], 'utun6')
+
+    with_list = cn_firewall(['1.0.1.0/24'])
+    with_list.define_singleton_method(:cn_table_path) { table }
+    assert_equal rules, with_list.prepare_cn_table(rules)
+    assert_equal "1.0.1.0/24\n", File.read(table)
+
+    without = cn_firewall(nil)
+    without.define_singleton_method(:cn_table_path) { table }
+    assert_equal rules, without.prepare_cn_table(rules), 'an existing list is kept at boot'
+    File.delete(table)
+    stripped = without.prepare_cn_table(rules)
+    refute_includes stripped, 'netguard_cn'
+    refute_includes stripped, '# cn-direct'
+    assert_includes stripped, 'block out all'
+
+    @config.data['allow_cn_direct'] = false
+    File.write(table, "1.0.1.0/24\n")
+    refute_includes without.prepare_cn_table(rules), 'netguard_cn', 'turned off: never reuse the old list'
+  end
+
+  def test_configure_toggles_cn_direct
+    env = { 'NETGUARD_HOME' => @tmp, 'LC_ALL' => 'en_US.UTF-8' }
+    cli = File.expand_path('../bin/netguard', __dir__)
+    out, status = Open3.capture2e(env, RbConfig.ruby, cli, 'configure', '--cn-direct')
+    assert status.success?, out
+    assert_equal true, NetGuard::Config.new(@tmp).data['allow_cn_direct']
+    out, status = Open3.capture2e(env, RbConfig.ruby, cli, 'configure', '--no-cn-direct')
+    assert status.success?, out
+    assert_equal false, NetGuard::Config.new(@tmp).data['allow_cn_direct']
+  end
 end

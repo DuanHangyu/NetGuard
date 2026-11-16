@@ -24,6 +24,17 @@ Clash TUN 的 fake-ip 模式会把节点域名在系统解析里变成 198.18.x�
 
 监控每个周期重新解析并比较规则，节点 IP 变化或 TUN 变化时才重新加载 PF。
 
+## 国内直连（可选，默认关闭）
+
+开启后 anchor 增加 `table <netguard_cn> persist file "/etc/pf.anchors/com.netguard.cn"` 和一条无状态放行规则：
+
+- 列表来自 Clash Verge 的 `geoip.dat`（与 Clash 的 `GEOIP,CN` 判定同源）。只取 IPv4，丢弃前缀短于 /8 的条目，并要求至少 1000 段，以防文件异常导致大范围放行。
+- 放行规则位于 DNS 拦截之后、`block out all` 之前；IPv6 仍全部拦截（除经 TUN）。
+- 仅在 TUN 存在时生成；lock-only 规则不含国内直连。
+- 写入表文件失败或列表不可用时，安装前会删除这两行，保证 `pfctl -f` 一定能加载，不因缺文件而让 PF 整体失效。开机自愈时如果 geoip.dat 读不到，沿用上次写入的表文件。
+- 关闭开关后，自愈不会再使用旧表。
+- 风险：任何本机进程都可以直接访问中国大陆 IP，访问时暴露真实 IP。不允许任何非大陆目的地直连。`config.yml` 由用户可写，root 监控会应用其中的开关；这与代理端点配置的信任模型相同。
+
 ## 启用前必须确认
 
 1. 已阅读 `bin/netguard plan` 的输出，TUN 名称与代理端点正确。

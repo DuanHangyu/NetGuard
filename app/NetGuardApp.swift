@@ -26,6 +26,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var stopButton: NSButton!
     private var clashButton: NSButton!
     private var chooseButton: NSButton!
+    private var cnDirectBox: NSButton!
+    private var cnDirectNote: NSTextField!
     private var logView: NSTextView!
     private var busy = false
     private var refreshing = false
@@ -94,7 +96,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func buildWindow() {
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 720),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 754),
                           styleMask: [.titled, .closable, .miniaturizable],
                           backing: .buffered, defer: false)
         window.title = "NetGuard"
@@ -102,15 +104,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.isReleasedWhenClosed = false
 
         guard let content = window.contentView else { return }
-        let shield = makeLabel("🛡", NSRect(x: 28, y: 650, width: 50, height: 46), size: 38)
+        let shield = makeLabel("🛡", NSRect(x: 28, y: 684, width: 50, height: 46), size: 38)
         content.addSubview(shield)
-        content.addSubview(makeLabel("NetGuard", NSRect(x: 86, y: 664, width: 500, height: 30),
+        content.addSubview(makeLabel("NetGuard", NSRect(x: 86, y: 698, width: 500, height: 30),
                                      size: 26, weight: .bold))
         content.addSubview(makeLabel("代理失效时保持断网，不自动恢复家庭宽带直连 · macOS 主机版",
-                                     NSRect(x: 86, y: 638, width: 566, height: 24),
+                                     NSRect(x: 86, y: 672, width: 566, height: 24),
                                      size: 12, color: .secondaryLabelColor))
 
-        let statusBox = NSView(frame: NSRect(x: 28, y: 520, width: 624, height: 102))
+        let statusBox = NSView(frame: NSRect(x: 28, y: 554, width: 624, height: 102))
         statusBox.wantsLayer = true
         statusBox.layer?.backgroundColor = NSColor.quaternaryLabelColor.cgColor
         statusBox.layer?.cornerRadius = 12
@@ -129,19 +131,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusDetail.cell?.isScrollable = false
         statusBox.addSubview(statusDetail)
 
-        content.addSubview(makeLabel("代理配置", NSRect(x: 28, y: 486, width: 96, height: 20),
+        content.addSubview(makeLabel("代理配置", NSRect(x: 28, y: 520, width: 96, height: 20),
                                      size: 12, weight: .medium))
-        configLabel = makeLabel("尚未选择", NSRect(x: 126, y: 486, width: 388, height: 20),
+        configLabel = makeLabel("尚未选择", NSRect(x: 126, y: 520, width: 388, height: 20),
                                 size: 12, color: .secondaryLabelColor)
         content.addSubview(configLabel)
-        chooseButton = makeButton("选择 YAML…", NSRect(x: 520, y: 480, width: 132, height: 30),
+        chooseButton = makeButton("选择 YAML…", NSRect(x: 520, y: 514, width: 132, height: 30),
                                   action: #selector(chooseYAML))
         chooseButton.controlSize = .regular
         content.addSubview(chooseButton)
 
         content.addSubview(makeLabel("使用前提：Clash Verge 已连接节点并开启 TUN；配置需与 Clash 当前使用的一致。",
-                                     NSRect(x: 28, y: 450, width: 624, height: 24),
+                                     NSRect(x: 28, y: 484, width: 624, height: 24),
                                      size: 12, color: .secondaryLabelColor))
+
+        cnDirectBox = NSButton(checkboxWithTitle: "允许国内应用直连（微信、QQ、支付宝、国内网站等）",
+                               target: self, action: #selector(toggleCNDirect))
+        cnDirectBox.frame = NSRect(x: 28, y: 448, width: 470, height: 24)
+        cnDirectBox.font = .systemFont(ofSize: 13)
+        cnDirectBox.toolTip = "只放行 Clash 自己判定为中国大陆（GEOIP,CN,DIRECT）的 IPv4 地址；国外网站仍只能走代理。关闭后约 20 秒恢复全代理。"
+        content.addSubview(cnDirectBox)
+        cnDirectNote = makeLabel("关闭：全部只走代理", NSRect(x: 500, y: 450, width: 152, height: 20),
+                                 size: 11, color: .secondaryLabelColor)
+        cnDirectNote.alignment = .right
+        content.addSubview(cnDirectNote)
 
         startButton = makeButton("一键启动保护", NSRect(x: 28, y: 382, width: 624, height: 48),
                                  action: #selector(startProtection))
@@ -409,6 +422,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // No administrator prompt: the root monitor re-reads config.yml every tick and
+    // installs the matching PF rules within ~20 s.
+    @objc private func toggleCNDirect() {
+        let turnOn = cnDirectBox.state == .on
+        guard !busy else {
+            cnDirectBox.state = turnOn ? .off : .on
+            return
+        }
+        if turnOn {
+            let alert = NSAlert()
+            alert.messageText = "允许国内应用直连？"
+            alert.informativeText = "开启后，Clash 规则判定为“中国大陆直连”（GEOIP,CN,DIRECT）的连接可以不经代理直接访问，例如微信、QQ、支付宝和国内网站。\n\n" +
+                "• 这些国内服务会看到你本地宽带的真实 IP（与不用 NetGuard 时一样）。\n" +
+                "• 国外网站和其他所有地址仍然只能走代理；代理断开时国外流量继续锁网。\n" +
+                "• Clash TUN 不在时，国内直连也会一起锁住。\n" +
+                "• 普通 DNS（53/853 端口）仍然被拦截，防止 DNS 泄露。"
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "开启国内直连")
+            alert.addButton(withTitle: "取消")
+            guard alert.runModal() == .alertFirstButtonReturn else {
+                cnDirectBox.state = .off
+                return
+            }
+        }
+        cnDirectBox.isEnabled = false
+        workQueue.async {
+            let result = self.backend(["configure", turnOn ? "--cn-direct" : "--no-cn-direct"])
+            self.appendLog(result.output)
+            DispatchQueue.main.async {
+                self.cnDirectBox.isEnabled = true
+                if !result.succeeded {
+                    self.cnDirectBox.state = turnOn ? .off : .on
+                    self.showAlert("设置未保存", self.tail(result.output))
+                } else if self.isProtected {
+                    self.appendLog(turnOn ? "国内直连已开启：后台监控约 20 秒内应用，微信等随后即可连接。"
+                                          : "国内直连已关闭：后台监控约 20 秒内恢复为全部只走代理。")
+                }
+                self.refreshStatus()
+            }
+        }
+    }
+
     @objc private func openClash() {
         let candidates = ["/Applications/Clash Verge.app", "/Applications/Clash Verge Rev.app"]
         if let path = candidates.first(where: { FileManager.default.fileExists(atPath: $0) }) {
@@ -445,6 +500,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let exitChanged = exitLock.contains("变化")
         let pfBroken = pf.hasPrefix("异常")
         let heals = Int((value(after: "自愈次数：", in: output) ?? "0").prefix { $0.isNumber }) ?? 0
+        let cnDirect = value(after: "国内直连：", in: output) ?? "关闭"
+        let cnOn = cnDirect.hasPrefix("开启")
+        if cnDirectBox.isEnabled { cnDirectBox.state = cnOn ? .on : .off }
+        cnDirectNote.stringValue = !cnOn ? "关闭：全部只走代理"
+            : (cnDirect.contains("不可用") ? "开启，但列表不可用" : "开启：国内直连")
+        cnDirectNote.textColor = cnDirect.contains("不可用") ? .systemOrange : .secondaryLabelColor
+        cnDirectNote.toolTip = cnDirect
 
         if isProtected {
             if exitChanged {
@@ -599,7 +661,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showAbout() {
         let alert = NSAlert()
-        alert.messageText = "NetGuard 0.2.0"
+        alert.messageText = "NetGuard 0.4.0"
         alert.informativeText = "macOS 主机 fail-closed 网络锁。\n\n复用 Clash/Mihomo TUN，以 PF 兜底。它降低代理故障导致的意外直连风险，但不能保证账号不被封禁，也不提供 Cage 的独立文件系统或应用隔离。"
         alert.addButton(withTitle: "知道了")
         alert.runModal()

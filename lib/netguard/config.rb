@@ -16,7 +16,8 @@ module NetGuard
       'check_interval' => 20,
       'proxy_endpoints' => [],
       'bootstrap_dns' => [],
-      'clash_config' => nil
+      'clash_config' => nil,
+      'allow_cn_direct' => false
     }.freeze
 
     attr_reader :home, :path, :data
@@ -46,6 +47,14 @@ module NetGuard
 
     def self.verge_runtime_path(home = System.user_home)
       path = File.join(home, VERGE_RUNTIME)
+      File.file?(path) ? path : nil
+    end
+
+    # Clash Verge keeps the geoip database it routes GEOIP rules with beside the
+    # runtime config. Same lookup rule as follow_path: the user home, not root.
+    def geoip_path
+      dir = File.join(File.dirname(@home), File.dirname(VERGE_RUNTIME))
+      path = File.join(dir, 'geoip.dat')
       File.file?(path) ? path : nil
     end
 

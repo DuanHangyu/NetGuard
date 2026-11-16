@@ -54,7 +54,8 @@ module NetGuard
         'exit_ip' => network.value, 'expected_exit_ip' => expected, 'exit_mismatch' => exit_mismatch,
         'pf' => pf, 'pf_problems' => pf_problems,
         'heals' => @heals, 'last_heal' => @last_heal,
-        'clash_config' => @config.follow_path, 'clash_reloaded_at' => @clash_reloaded_at
+        'clash_config' => @config.follow_path, 'clash_reloaded_at' => @clash_reloaded_at,
+        'cn_direct' => @firewall.cn_direct_summary
       )
       status = healthy ? 'OK' : 'LOCKED'
       status = 'ALERT 出口变化' if exit_mismatch

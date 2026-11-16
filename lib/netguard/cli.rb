@@ -62,6 +62,7 @@ module NetGuard
         o.on('--language LANG') { |v| options[:expected_language] = v }
         o.on('--expected-ip IP') { |v| options[:expected_ip] = v }
         o.on('--no-lan') { options[:allow_lan] = false }
+        o.on('--[no-]cn-direct', '国内直连：放行 Clash geoip.dat 中的中国大陆 IPv4（微信等）') { |v| options[:allow_cn_direct] = v }
       end.parse!(argv)
       if options[:from] == 'auto'
         options[:from] = Config.verge_runtime_path or raise ArgumentError, '没有找到 Clash Verge 运行配置（clash-verge.yaml）；请用 --from 指定 YAML'
@@ -77,12 +78,15 @@ module NetGuard
         puts "Clash 引导 DNS（将放行）：#{dns.empty? ? '无' : dns.join(', ')}"
         puts "未放行的 DNS 条目（非字面 IPv4）：#{config.skipped_dns.join(', ')}" if config.skipped_dns.any?
       end
+      unless options[:allow_cn_direct].nil?
+        puts "国内直连：#{options[:allow_cn_direct] ? '开启' : '关闭'}（保护运行中时，后台监控约 20 秒内自动应用）"
+      end
       puts '尚未修改 PF 或系统代理。'
     end
 
     def plan
       rules = firewall.plan
-      firewall.resolver.warnings.each { |w| warn "提示：#{w}" }
+      (firewall.resolver.warnings + firewall.warnings).uniq.each { |w| warn "提示：#{w}" }
       puts rules
     end
 
@@ -154,6 +158,7 @@ module NetGuard
       puts "健康状态：#{health['healthy'] == true ? '正常' : '锁定/未知'}"
       puts "出口锁定：#{exit_line(health)}" if enabled
       puts "自愈次数：#{health['heals'] || 0}#{health.dig('last_heal', 'at') ? "（最近 #{health.dig('last_heal', 'at')}：#{Array(health.dig('last_heal', 'problems')).join('、')}）" : ''}" if enabled
+      puts "国内直连：#{cn_line(health, enabled)}"
       puts "Clash 配置（监控跟随）：#{config.follow_path || '未记录'}#{health['clash_reloaded_at'] ? "（#{health['clash_reloaded_at']} 自动重新导入）" : ''}"
       puts "最近检查：#{health['checked_at'] || '无'}"
       puts "最近结果：#{health['detail'] || '无'}"
@@ -168,6 +173,12 @@ module NetGuard
       problems.empty? ? '保护完整（监控确认）' : "异常：#{problems.join('、')}"
     end
 
+    def cn_line(health, enabled)
+      return '关闭（只允许代理）' unless config.data['allow_cn_direct']
+      return "开启：#{health['cn_direct']}" if enabled && health['cn_direct']
+      '开启'
+    end
+
     def exit_line(health)
       expected = health['expected_exit_ip'] || firewall.expected_exit_ip
       return '未锁定' unless expected
@@ -180,6 +191,7 @@ module NetGuard
         NetGuard #{VERSION} — macOS 主机 fail-closed 网络锁
         doctor                       只读检查环境
         configure --from FILE|auto   仅导入代理 server/port（auto = Clash Verge 运行配置）
+        configure --[no-]cn-direct   开关国内直连（微信等 Clash 判定 DIRECT 的中国大陆 IP）
         plan                         显示将要生成的 PF 规则
         enable --apply               实际启用（需要 sudo 和二次输入）
         check [--preflight] [--browser]  启用前预检或启用后完整网络检查

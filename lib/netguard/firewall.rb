@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 require 'fileutils'
 require 'time'
+require 'digest'
 
 module NetGuard
   class Firewall
@@ -15,6 +16,12 @@ PF_CONF = '/etc/pf.conf'
 # Inbound traffic is not filtered, so return packets need no state.
 STATELESS = 'flags any no state'
 LOOPBACK_RULE = 'pass quick on lo0 all flags any no state'
+# Optional "国内直连": mainland-China IPv4 ranges from Clash's own geoip.dat, so the
+# connections Clash itself routes `GEOIP,CN,DIRECT` (WeChat, Alipay, ...) can leave
+# via the physical uplink. Everything else stays proxy-only.
+CN_TABLE = 'netguard_cn'
+CN_TABLE_PATH = '/etc/pf.anchors/com.netguard.cn'
+CN_MARK = '# cn-direct'
 
     attr_reader :config
 
@@ -42,6 +49,12 @@ LOOPBACK_RULE = 'pass quick on lo0 all flags any no state'
         '# NetGuard fail-closed anchor; direct networking is never restored by the monitor.',
         LOOPBACK_RULE
       ]
+      # Only with a live TUN: when Clash is down (lock-only) nothing goes direct.
+      cn = tun && !tun.empty? ? cn_direct_cidrs : nil
+      if cn
+        lines.insert(1, "#{CN_MARK} #{cn.length} ranges sha256:#{Digest::SHA256.hexdigest(cn.join("\n"))[0, 16]}",
+                     "table <#{CN_TABLE}> persist file \"#{CN_TABLE_PATH}\"")
+      end
       lines << "pass out quick on #{tun} all #{STATELESS}" if tun && !tun.empty?
       resolved.uniq { |e| [e['ip'], e['port']] }.each do |endpoint|
         protocol = endpoint['protocol'] || 'tcp'
@@ -54,6 +67,8 @@ LOOPBACK_RULE = 'pass quick on lo0 all flags any no state'
       end
       # DNS blocking precedes LAN access so a router cannot be used as a bypass resolver.
       lines << 'block out quick inet proto { tcp, udp } from any to any port { 53, 853 }'
+      # After the DNS block, so mainland resolvers cannot become a bypass for DNS.
+      lines << "pass out quick inet from any to <#{CN_TABLE}> #{STATELESS}" if cn
       if config.data['allow_lan']
         lines << 'pass out quick inet to { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 224.0.0.0/4 } ' + STATELESS
         lines << 'pass out quick inet proto udp from any to any port { 67, 68 } ' + STATELESS
@@ -83,6 +98,42 @@ LOOPBACK_RULE = 'pass quick on lo0 all flags any no state'
         'block out quick inet6 all',
         'block out all'
       ].join("\n") + "\n"
+    end
+
+    def warnings
+      @warnings ||= []
+    end
+
+    def note_warning(message)
+      warnings << message unless warnings.include?(message)
+    end
+
+    # Mainland ranges when 国内直连 is on and Clash's geoip.dat is readable; nil
+    # otherwise (then nothing extra is allowed). Cached by file mtime because the
+    # monitor re-renders every tick.
+    def cn_direct_cidrs
+      return nil unless config.data['allow_cn_direct']
+      path = config.geoip_path
+      unless path
+        note_warning('已开启国内直连，但找不到 Clash Verge 的 geoip.dat；国内直连暂不放行')
+        return nil
+      end
+      key = [path, File.mtime(path)]
+      return @cn_cache[1] if @cn_cache && @cn_cache[0] == key
+      cidrs = GeoIP.ipv4_cidrs(path, 'CN')
+      raise ArgumentError, 'geoip.dat 中的 CN 网段数量异常' if cidrs.length < 1000
+      @cn_cache = [key, cidrs]
+      cidrs
+    rescue StandardError => e
+      note_warning("国内直连列表读取失败，暂不放行：#{e.message}")
+      nil
+    end
+
+    # Status line source for CLI/monitor: nil when off.
+    def cn_direct_summary
+      return nil unless config.data['allow_cn_direct']
+      cidrs = cn_direct_cidrs
+      cidrs ? "#{cidrs.length} 个中国大陆 IPv4 网段（Clash geoip.dat）" : '已开启但列表不可用，未放行'
     end
 
     # Domain-based nodes only work if mihomo can still resolve them once PF is on.
@@ -184,6 +235,7 @@ LOOPBACK_RULE = 'pass quick on lo0 all flags any no state'
     end
 
     def install_anchor_rules(rules)
+      rules = prepare_cn_table(rules)
       File.write(ANCHOR_PATH, rules)
       File.chmod(0o600, ANCHOR_PATH)
       text = File.read(PF_CONF)
@@ -192,8 +244,41 @@ LOOPBACK_RULE = 'pass quick on lo0 all flags any no state'
         File.write(PF_CONF, text)
       end
       out, err, status = System.run('/sbin/pfctl', '-f', PF_CONF)
-      raise RuntimeError, "PF 加载失败：#{err}#{out}" unless status.success?
+      unless status.success?
+        # 国内直连 is optional: never let it be the reason PF stays unloaded.
+        stripped = strip_cn(rules)
+        raise RuntimeError, "PF 加载失败：#{err}#{out}" if stripped == rules
+        File.write(ANCHOR_PATH, stripped)
+        out, err, status = System.run('/sbin/pfctl', '-f', PF_CONF)
+        raise RuntimeError, "PF 加载失败：#{err}#{out}" unless status.success?
+        note_warning("国内直连表加载失败，已退回全代理规则：#{err}#{out}".strip)
+      end
       System.run('/sbin/pfctl', '-E')
+    end
+
+    def strip_cn(rules)
+      rules.lines.reject { |l| l.start_with?(CN_MARK) || l.include?("<#{CN_TABLE}>") }.join
+    end
+
+    # A rule set referencing a missing table file would make `pfctl -f` fail and
+    # leave the machine unprotected, so write the table first, or, if no list is
+    # available (heal at boot with geoip unreadable and no previous file), drop
+    # the 国内直连 lines and stay strictly proxy-only.
+    def prepare_cn_table(rules)
+      return rules unless rules.include?("<#{CN_TABLE}>")
+      cidrs = cn_direct_cidrs
+      if cidrs
+        File.write(cn_table_path, cidrs.join("\n") + "\n")
+        File.chmod(0o644, cn_table_path)
+        return rules
+      end
+      # Keep a previously written list rather than dropping the rule (boot heal).
+      return rules if config.data['allow_cn_direct'] && File.file?(cn_table_path) && File.size(cn_table_path).positive?
+      strip_cn(rules)
+    end
+
+    def cn_table_path
+      CN_TABLE_PATH
     end
 
     def disable!
@@ -201,6 +286,7 @@ LOOPBACK_RULE = 'pass quick on lo0 all flags any no state'
       remove_managed_lines
       System.run('/sbin/pfctl', '-a', ANCHOR, '-F', 'all')
       File.delete(ANCHOR_PATH) if File.file?(ANCHOR_PATH)
+      File.delete(cn_table_path) if File.file?(cn_table_path)
       if File.file?(PF_CONF)
         out, err, status = System.run('/sbin/pfctl', '-f', PF_CONF)
         raise RuntimeError, "恢复 PF 配置失败：#{err}#{out}" unless status.success?
