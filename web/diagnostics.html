@@ -1,10 +1,76 @@
 <!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>NetGuard Browser Check</title>
-<style>body{font:16px/1.6 -apple-system,sans-serif;max-width:760px;margin:48px auto;padding:0 20px;background:#10141b;color:#e9eef5}main{background:#19212c;padding:28px;border-radius:16px}code{color:#8fd3ff}#status{font-weight:600}</style>
-<main><h1>NetGuard 浏览器检查</h1><p>本页面仅向 <code>127.0.0.1</code> 报告语言、时区和平台，不收集 Cookie、浏览历史或表单内容。</p><pre id="result">正在读取…</pre><p id="status">正在报告给本机 NetGuard…</p></main>
+<style>body{font:16px/1.6 -apple-system,sans-serif;max-width:760px;margin:48px auto;padding:0 20px;background:#10141b;color:#e9eef5}main{background:#19212c;padding:28px;border-radius:16px}code{color:#8fd3ff}#status{font-weight:600}pre{white-space:pre-wrap;word-break:break-all}</style>
+<main><h1>NetGuard 浏览器检查</h1>
+<p>本页面检查语言、时区，以及浏览器层面的泄露：WebRTC 能否暴露真实 IP、浏览器实际的 IPv4/IPv6 出口。
+结果只报告给 <code>127.0.0.1</code> 上的 NetGuard。为测出口，页面会访问 <code>api.ipify.org</code> / <code>api6.ipify.org</code>（只返回你的出口 IP），并向公共 STUN 服务器发起 WebRTC 探测；不收集 Cookie、浏览历史或表单内容。</p>
+<pre id="result">正在检测（约 6 秒）…</pre><p id="status"></p></main>
 <script>
-const report={languages:navigator.languages||[navigator.language],timezone:Intl.DateTimeFormat().resolvedOptions().timeZone,platform:navigator.platform,reportedAt:new Date().toISOString()};
-document.querySelector('#result').textContent=JSON.stringify(report,null,2);
-fetch('/report',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(report)}).then(()=>{document.querySelector('#status').textContent='✓ 已报告，可以回到终端查看结果。';}).catch(e=>{document.querySelector('#status').textContent='报告失败：'+e;});
+const withTimeout = (promise, ms) => Promise.race([promise, new Promise(r => setTimeout(() => r(null), ms))]);
+
+async function exitIp(url) {
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 5000);
+    const res = await fetch(url, { cache: 'no-store', signal: ctrl.signal });
+    clearTimeout(timer);
+    return (await res.json()).ip || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Collect every ICE candidate address. "srflx" is the public address a STUN
+// server saw; "host" may show raw interface addresses if mDNS masking is off.
+async function webrtc() {
+  if (!window.RTCPeerConnection) return { supported: false, candidates: [] };
+  const candidates = [];
+  let pc;
+  try {
+    pc = new RTCPeerConnection({ iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun.cloudflare.com:3478' }
+    ] });
+    pc.createDataChannel('netguard');
+    const done = new Promise(resolve => {
+      pc.onicecandidate = e => {
+        if (!e.candidate) return resolve();
+        const parts = e.candidate.candidate.split(' ');
+        const typ = parts[parts.indexOf('typ') + 1];
+        candidates.push({ address: parts[4], type: typ, protocol: parts[2] });
+      };
+    });
+    await pc.setLocalDescription(await pc.createOffer());
+    await withTimeout(done, 5000);
+    return { supported: true, candidates };
+  } catch (e) {
+    return { supported: true, candidates, error: String(e) };
+  } finally {
+    if (pc) pc.close();
+  }
+}
+
+(async () => {
+  const [ipv4, ipv6, rtc] = await Promise.all([
+    exitIp('https://api.ipify.org?format=json'),
+    exitIp('https://api6.ipify.org?format=json'),
+    webrtc()
+  ]);
+  const report = {
+    languages: navigator.languages || [navigator.language],
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    platform: navigator.platform,
+    browser_ipv4: ipv4,
+    browser_ipv6: ipv6,
+    webrtc: rtc,
+    reportedAt: new Date().toISOString()
+  };
+  document.querySelector('#result').textContent = JSON.stringify(report, null, 2);
+  const status = document.querySelector('#status');
+  status.textContent = '正在报告给本机 NetGuard…';
+  fetch('/report', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(report) })
+    .then(() => { status.textContent = '✓ 已报告，可以回到 NetGuard 查看结果。'; })
+    .catch(e => { status.textContent = '报告失败：' + e; });
+})();
 </script></html>

@@ -11,7 +11,7 @@ module NetGuard
       @web_root = web_root
     end
 
-    def run(wait_seconds = 60)
+    def run(wait_seconds = 60, exit_ip: nil)
       server = TCPServer.new('127.0.0.1', 0)
       port = server.addr[1]
       report = nil
@@ -48,18 +48,55 @@ module NetGuard
       system('/usr/bin/open', '-a', 'Google Chrome', "http://127.0.0.1:#{port}/")
       thread.join(wait_seconds + 2)
       raise RuntimeError, '等待浏览器报告超时' unless report
+      evaluate(report, exit_ip)
+    ensure
+      server.close if server && !server.closed?
+    end
+
+    # Pure: turns the page's report into results. exit_ip is the terminal's proxy
+    # exit (nil when unknown).
+    def evaluate(report, exit_ip, locals = Leak.local_ipv6)
       checks = []
       expected_tz = @config.data['expected_timezone']
       expected_lang = @config.data['expected_language']
       checks << Checks::Result.new('browser_timezone', report['timezone'] == expected_tz, "浏览器时区：#{report['timezone']}", false)
       languages = Array(report['languages'])
       checks << Checks::Result.new('browser_language', languages.first == expected_lang, "浏览器语言：#{languages.join(',')}", false)
+      checks << browser_exit(report['browser_ipv4'], exit_ip)
+      checks << browser_ipv6(report['browser_ipv6'], exit_ip, locals)
+      checks << webrtc(report['webrtc'] || {}, exit_ip, locals)
       checks
-    ensure
-      server.close if server && !server.closed?
     end
 
     private
+
+    def browser_exit(ip, exit_ip)
+      return Checks::Result.new('browser_exit', false, '浏览器无法获取 IPv4 出口（代理断开或被拦截）', false) if ip.to_s.empty?
+      if exit_ip && ip != exit_ip
+        return Checks::Result.new('browser_exit', false, "浏览器出口 #{ip} 与终端出口 #{exit_ip} 不同：浏览器走了别的路径", true)
+      end
+      Checks::Result.new('browser_exit', true, "浏览器出口：#{ip}#{exit_ip ? '（与终端一致）' : ''}", true)
+    end
+
+    def browser_ipv6(ip, exit_ip, locals)
+      return Checks::Result.new('browser_ipv6', true, '浏览器 IPv6 直连未成功', true) if ip.to_s.empty?
+      if Leak.own_ipv6?(ip, locals)
+        return Checks::Result.new('browser_ipv6', false, "浏览器 IPv6 泄漏：出口为本机宽带 IPv6 #{ip}", true)
+      end
+      Checks::Result.new('browser_ipv6', true, "浏览器 IPv6 请求经代理（#{ip}）", true)
+    end
+
+    def webrtc(rtc, exit_ip, locals)
+      return Checks::Result.new('webrtc', true, '浏览器不支持 WebRTC', true) if rtc['supported'] == false
+      addresses = Array(rtc['candidates']).map { |c| c['address'].to_s }.uniq
+      leaked = addresses.select { |ip| Leak.exposes_real_ip?(ip, exit_ip, locals) }
+      unless leaked.empty?
+        return Checks::Result.new('webrtc', false, "WebRTC 泄漏真实 IP：#{leaked.join(', ')}", true)
+      end
+      seen = addresses.select { |ip| Leak.public?(ip) }
+      detail = seen.empty? ? 'WebRTC 未暴露任何公网 IP（STUN 未获得地址）' : "WebRTC 只看到代理出口 #{seen.join(', ')}"
+      Checks::Result.new('webrtc', true, detail, true)
+    end
 
     def respond(client, status, type, body)
       client.write("HTTP/1.1 #{status} OK\r\nContent-Type: #{type}\r\nContent-Length: #{body.bytesize}\r\nCache-Control: no-store\r\n\r\n#{body}")

@@ -122,7 +122,10 @@ module NetGuard
                 else
                   Checks.all(config.data.merge('expected_ip' => firewall.expected_exit_ip))
                 end
-      results.concat(BrowserCheck.new(config, File.join(ROOT, 'web')).run) if browser
+      if browser
+        exit_ip = results.find { |r| r.name == 'public_ip' }&.value
+        results.concat(BrowserCheck.new(config, File.join(ROOT, 'web')).run(exit_ip: exit_ip))
+      end
       results.each { |r| puts "#{r.ok ? 'PASS' : 'FAIL'} #{r.name}: #{r.detail}" }
       critical_failure = results.any? { |r| r.critical && !r.ok }
       raise RuntimeError, '存在关键网络检查失败；请保持锁网并排查' if critical_failure

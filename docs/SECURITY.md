@@ -52,6 +52,7 @@ Clash TUN 的 fake-ip 模式会把节点域名在系统解析里变成 198.18.x�
 - 图形界面的启动按钮与 macOS 管理员授权构成用户确认；辅助程序仍通过标准输入满足 CLI 原有的 `ENABLE NETGUARD` 二次检查，没有删除该核心校验。
 - 启用成功后才安装 `com.netguard.monitor`。监控服务安装或启动失败时只报告错误，**不会为了恢复可用性而自动关闭 PF**。
 - 停止或紧急恢复会先移除监控服务，再只清理 NetGuard 自己的 PF anchor 和托管配置，不修改 Clash 节点、系统代理或浏览器。
+- 监控每 2 秒核对一次 PF；防火墙被外部关闭后，最长约 2 秒的未保护窗口。
 - 开机保护由监控服务承担；在 launchd 拉起监控之前的极短窗口内不受保护。
 
 ## 故障处理
@@ -70,7 +71,9 @@ sudo /Users/qing/Projects/NetGuard/bin/netguard-recovery
 
 - `curl --interface en0` 失败是直连受阻的一项证据，但不是形式化安全证明。
 - 公共 DNS 请求被 TUN 接管时也可能成功，因此还要结合路由和 PF 规则判断。
-- 浏览器页面只报告 JS 语言和时区，不尝试收集 WebRTC IP，也不读取浏览器 Cookie。
+- 浏览器页面报告 JS 语言、时区、浏览器 IPv4/IPv6 出口（访问 api.ipify.org / api6.ipify.org）和 WebRTC ICE 候选地址（向 Google、Cloudflare 公共 STUN 发起绑定请求）。结果只发给 127.0.0.1，不读取 Cookie 或历史。
+- WebRTC 判定：任何不等于代理出口的公网地址，或与本机宽带 IPv6 同一 /64 的地址，都算泄露。Chrome 的 mDNS 主机名（*.local）和内网地址不算。
+- 浏览器 DNS 泄露没有做成网页检测，因为那需要第三方泄露测试域名。改为在主机侧确认两点：系统 DNS 返回 Clash fake-ip（说明由 Clash 接管）；PF 拦截所有非引导 DNS。
 - 第三方出口检查服务只能提供采样结果；NetGuard 不保证平台认可该出口。
 
 ## 数据边界

@@ -190,8 +190,36 @@ class NetGuardTest < Minitest::Test
     NetGuard::System.stub(:run, ["203.0.113.8\n", '', ok]) do
       assert NetGuard::Checks.ipv6_check.ok?, 'IPv4 exit via TUN proxy is not a leak'
     end
+    locals = ['240e:1:0:0:aaaa::7']
     NetGuard::System.stub(:run, ["240e:1::5\n", '', ok]) do
-      refute NetGuard::Checks.ipv6_check.ok?, 'a real IPv6 exit is a leak'
+      refute NetGuard::Checks.ipv6_check(locals).ok?, 'own /64 (privacy address rotated) is a leak'
+    end
+    NetGuard::System.stub(:run, ["2001:db8:77::1\n", '', ok]) do
+      assert NetGuard::Checks.ipv6_check(locals).ok?, 'a proxy node IPv6 exit is not our line'
+    end
+  end
+
+  def test_leak_classification
+    assert NetGuard::Leak.public?('66.1.2.3')
+    %w[10.1.1.1 192.168.1.5 198.18.0.9 100.64.1.1 fe80::1 fd00::5 ::1].each do |ip|
+      refute NetGuard::Leak.public?(ip), ip
+    end
+    refute NetGuard::Leak.public?('abc.local'), 'Chrome mDNS host names are not addresses'
+    locals = ['2408:8000:1:2::99']
+    assert NetGuard::Leak.exposes_real_ip?('2408:8000:1:2::1234', '66.1.2.3', locals)
+    assert NetGuard::Leak.exposes_real_ip?('183.1.2.3', '66.1.2.3', locals)
+    refute NetGuard::Leak.exposes_real_ip?('66.1.2.3', '66.1.2.3', locals)
+    refute NetGuard::Leak.exposes_real_ip?('192.168.1.5', '66.1.2.3', locals)
+  end
+
+  def test_system_dns_check_recognises_clash_fake_ip
+    fake = [Addrinfo.tcp('198.18.0.12', 443)]
+    Addrinfo.stub(:getaddrinfo, fake) { assert NetGuard::Checks.system_dns_check.ok? }
+    real = [Addrinfo.tcp('93.184.215.14', 443)]
+    Addrinfo.stub(:getaddrinfo, real) do
+      result = NetGuard::Checks.system_dns_check
+      refute result.ok?
+      refute result.critical
     end
   end
   # ---- self-heal, exit lock, boot, Clash runtime config ----------------------
@@ -503,5 +531,118 @@ class NetGuardTest < Minitest::Test
     out, status = Open3.capture2e(env, RbConfig.ruby, cli, 'configure', '--no-cn-direct')
     assert status.success?, out
     assert_equal false, NetGuard::Config.new(@tmp).data['allow_cn_direct']
+  end
+
+  # --- fast heal loop, quiet log, rotation ---
+
+  def test_run_heals_every_short_interval_and_ticks_on_check_interval
+    state = { 'enabled_at' => 'x' }
+    firewall = fake_firewall(state: state)
+    @config.data['check_interval'] = 20
+    @config.data['heal_interval'] = 2
+    monitor = NetGuard::Monitor.new(@config, firewall)
+    events = []
+    clock = Time.at(1_000_000)
+    heal_results = [false, true, false, false]
+    monitor.define_singleton_method(:tick) { events << :tick; true }
+    monitor.define_singleton_method(:heal_pf) { events << :heal; heal_results.shift || false }
+    pauses = []
+    monitor.define_singleton_method(:pause) do |seconds|
+      pauses << seconds
+      clock += seconds
+      state.delete('enabled_at') if pauses.length >= 6
+    end
+    Time.stub(:now, -> { clock }) do
+      NetGuard::System.stub(:root?, true) { capture_io { monitor.run } }
+    end
+    assert_equal [2] * 6, pauses
+    # tick, heal(no), heal(repaired -> immediate tick), tick, heal, heal
+    assert_equal %i[tick heal heal tick heal heal], events
+  end
+
+  def test_interval_rejects_bad_values
+    monitor = NetGuard::Monitor.new(@config, fake_firewall)
+    @config.data['heal_interval'] = 0
+    assert_equal 2, monitor.interval('heal_interval', 2)
+    @config.data['heal_interval'] = 'x'
+    assert_equal 2, monitor.interval('heal_interval', 2)
+    @config.data['heal_interval'] = 5
+    assert_equal 5, monitor.interval('heal_interval', 2)
+  end
+
+  def test_identical_status_lines_are_logged_once_until_heartbeat
+    monitor = NetGuard::Monitor.new(@config, fake_firewall)
+    clock = Time.at(1_000_000)
+    out, = capture_io do
+      Time.stub(:now, -> { clock }) do
+        3.times { monitor.send(:log_status, 'OK 终端出口：203.0.113.1') }
+        monitor.send(:log_status, 'LOCKED 公网检查失败')
+        monitor.send(:log_status, 'OK 终端出口：203.0.113.1')
+        clock += NetGuard::Monitor::HEARTBEAT
+        monitor.send(:log_status, 'OK 终端出口：203.0.113.1')
+      end
+    end
+    assert_equal 4, out.lines.length, out
+  end
+
+  def test_rotation_only_touches_the_file_stdout_points_at
+    path = File.join(@tmp, 'watch.log')
+    File.write(path, 'x' * (NetGuard::Monitor::LOG_LIMIT + 1))
+    monitor = NetGuard::Monitor.new(@config, fake_firewall)
+    monitor.send(:rotate_log)
+    assert_equal NetGuard::Monitor::LOG_LIMIT + 1, File.size(path), 'test stdout is not watch.log: leave it alone'
+
+    script = <<~RB
+      $LOAD_PATH.unshift(#{File.expand_path('../lib', __dir__).inspect})
+      require 'netguard'
+      config = NetGuard::Config.new(#{@tmp.inspect})
+      NetGuard::Monitor.new(config, NetGuard::Firewall.new(config)).send(:rotate_log)
+      puts 'after-rotation'
+    RB
+    pid = spawn({ 'LC_ALL' => 'en_US.UTF-8' }, RbConfig.ruby, '-e', script, out: [path, 'a'], err: [path, 'a'])
+    Process.wait(pid)
+    assert_equal "after-rotation\n", File.read(path)
+    assert_equal NetGuard::Monitor::LOG_LIMIT + 1, File.size("#{path}.1")
+  end
+
+  # --- browser leak checks ---
+
+  def browser_results(report, exit_ip = '66.1.2.3', locals = ['2408:8000:1:2::99'])
+    base = { 'timezone' => 'America/Chicago', 'languages' => ['en-US'] }
+    NetGuard::BrowserCheck.new(@config, '/nonexistent').evaluate(base.merge(report), exit_ip, locals)
+                          .map { |r| [r.name, r] }.to_h
+  end
+
+  def test_browser_check_passes_when_everything_goes_through_proxy
+    r = browser_results('browser_ipv4' => '66.1.2.3', 'browser_ipv6' => nil,
+                        'webrtc' => { 'supported' => true, 'candidates' => [
+                          { 'address' => 'abcd-1234.local', 'type' => 'host' },
+                          { 'address' => '198.18.0.1', 'type' => 'host' }
+                        ] })
+    %w[browser_exit browser_ipv6 webrtc].each { |name| assert r[name].ok?, "#{name}: #{r[name].detail}" }
+  end
+
+  def test_browser_check_flags_webrtc_and_ipv6_leaks_and_path_mismatch
+    r = browser_results('browser_ipv4' => '183.1.2.3', 'browser_ipv6' => '2408:8000:1:2::abcd',
+                        'webrtc' => { 'supported' => true, 'candidates' => [
+                          { 'address' => '66.1.2.3', 'type' => 'srflx' },
+                          { 'address' => '183.1.2.3', 'type' => 'srflx' },
+                          { 'address' => '2408:8000:1:2::5', 'type' => 'host' }
+                        ] })
+    %w[browser_exit browser_ipv6 webrtc].each do |name|
+      refute r[name].ok?, name
+      assert r[name].critical, name
+    end
+    assert_includes r['webrtc'].detail, '183.1.2.3'
+    assert_includes r['webrtc'].detail, '2408:8000:1:2::5'
+    refute_includes r['webrtc'].detail, '66.1.2.3'
+  end
+
+  def test_browser_check_accepts_proxy_node_ipv6_and_srflx_equal_to_exit
+    r = browser_results('browser_ipv4' => '66.1.2.3', 'browser_ipv6' => '2001:db8:9::1',
+                        'webrtc' => { 'candidates' => [{ 'address' => '66.1.2.3', 'type' => 'srflx' }] })
+    assert r['browser_ipv6'].ok?
+    assert r['webrtc'].ok?
+    assert_includes r['webrtc'].detail, '只看到代理出口'
   end
 end

@@ -1,16 +1,24 @@
 # frozen_string_literal: true
 require 'json'
 require 'time'
+require 'fileutils'
 
 module NetGuard
   # Runs as the root LaunchDaemon com.netguard.monitor (RunAtLoad), so it is also
-  # the boot-time lock. Every tick, in this order:
+  # the boot-time lock.
+  #
+  # PF itself is verified every heal_interval (default 2 s; local pfctl only, no
+  # network). That bounds how long protection can stay switched off by anything
+  # else. The full tick runs every check_interval (default 20 s), in this order:
   #   1. heal PF  — re-apply protection if anything undid it (no DNS needed);
   #   2. follow the Clash config — re-import nodes after subscription/profile changes;
   #   3. update rules — TUN or node IP changes;
   #   4. check the exit IP against the address locked at enable time.
   # Each step fails independently; none of them ever disables the firewall.
   class Monitor
+    LOG_LIMIT = 1_000_000 # bytes; one previous file is kept as watch.log.1
+    HEARTBEAT = 1800      # seconds between repeated identical status lines
+
     attr_reader :heals
 
     def initialize(config, firewall)
@@ -21,20 +29,42 @@ module NetGuard
       @last_heal = nil
       @clash_mtime = nil
       @clash_reloaded_at = nil
+      @last_status = nil
+      @last_status_at = nil
+      @log_writes = 0
     end
 
     def run
       $stdout.sync = true
+      rotate_log
+      next_tick = Time.at(0)
       loop do
         break unless enabled?
-        tick
-        sleep Integer(@config.data['check_interval'] || 20)
+        if Time.now >= next_tick
+          tick
+          next_tick = Time.now + interval('check_interval', 20)
+        elsif System.root? && heal_pf
+          # Report the repair (health.json, GUI notification) right away.
+          next_tick = Time.at(0)
+        end
+        pause(interval('heal_interval', 2))
       end
       log '保护已被停止（state 中未启用），监控退出。'
     end
 
     def enabled?
       !@firewall.state['enabled_at'].nil?
+    end
+
+    def interval(key, default)
+      value = Integer(@config.data[key] || default)
+      value.positive? ? value : default
+    rescue ArgumentError, TypeError
+      default
+    end
+
+    def pause(seconds)
+      sleep seconds
     end
 
     def tick
@@ -59,26 +89,29 @@ module NetGuard
       )
       status = healthy ? 'OK' : 'LOCKED'
       status = 'ALERT 出口变化' if exit_mismatch
-      log "#{status} #{network.detail}#{pf_problems.empty? ? '' : "；PF：#{pf_problems.join('、')}"}"
+      log_status "#{status} #{network.detail}#{pf_problems.empty? ? '' : "；PF：#{pf_problems.join('、')}"}"
       healthy
     rescue StandardError => e
       write_health('healthy' => false, 'detail' => "监控异常：#{e.message}", 'heals' => @heals, 'last_heal' => @last_heal)
-      log "LOCKED #{e.message}；防火墙保持启用"
+      log_status "LOCKED #{e.message}；防火墙保持启用"
       false
     end
 
-    private
-
+    # Returns true when something had to be repaired.
     def heal_pf
       repaired = @firewall.heal!
-      return if repaired.empty?
+      return false if repaired.empty?
       @heals += 1
       @last_heal = { 'at' => Time.now.utc.iso8601, 'problems' => repaired }
       @last_rules = nil
       log "自愈：#{repaired.join('、')}，已重新加载 NetGuard 规则"
+      true
     rescue StandardError => e
       log "自愈失败：#{e.message}；将在下个周期重试"
+      false
     end
+
+    private
 
     def follow_clash_config
       path = @config.follow_path
@@ -120,8 +153,43 @@ module NetGuard
       nil
     end
 
+    # Steady state is not logged every 20 s: a line is written when the status
+    # changes, plus a heartbeat every HEARTBEAT seconds. health.json always has
+    # the latest result.
+    def log_status(message)
+      now = Time.now
+      return if message == @last_status && @last_status_at && now - @last_status_at < HEARTBEAT
+      @last_status = message
+      @last_status_at = now
+      log message
+    end
+
     def log(message)
-      puts "#{Time.now.strftime('%H:%M:%S')} #{message}"
+      puts "#{Time.now.strftime('%m-%d %H:%M:%S')} #{message}"
+      @log_writes += 1
+      rotate_log if (@log_writes % 50).zero?
+    end
+
+    # launchd points stdout/stderr at watch.log. Rotate by copy + truncate, then
+    # reopen in append mode so writes continue at the start of the empty file.
+    def rotate_log
+      path = File.join(@config.home, 'watch.log')
+      return unless File.file?(path) && File.size(path) > LOG_LIMIT && logging_to?(path)
+      FileUtils.cp(path, "#{path}.1")
+      File.truncate(path, 0)
+      $stdout.reopen(path, 'a')
+      $stderr.reopen(path, 'a')
+      $stdout.sync = true
+    rescue StandardError
+      nil
+    end
+
+    def logging_to?(path)
+      out = $stdout.stat
+      file = File.stat(path)
+      out.dev == file.dev && out.ino == file.ino
+    rescue StandardError
+      false
     end
   end
 end

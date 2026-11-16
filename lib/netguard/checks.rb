@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 require 'json'
 require 'timeout'
+require 'ipaddr'
+require 'socket'
 
 module NetGuard
   class Checks
@@ -30,6 +32,7 @@ module NetGuard
       results = [public_ip(config)]
       results << direct_interface_check(config)
       results << direct_dns_check
+      results << system_dns_check
       results << ipv6_check if config['block_ipv6']
       results << timezone_check(config)
       results << language_check(config)
@@ -52,18 +55,36 @@ module NetGuard
       Result.new('direct_dns', true, detail, true)
     end
 
-    def self.ipv6_check
+    def self.ipv6_check(locals = Leak.local_ipv6)
       out, _, status = System.run('/usr/bin/curl', '-6', '--silent', '--fail', '--max-time', '5', 'https://api64.ipify.org')
       return Result.new('ipv6', true, 'IPv6 公网直连未成功', true) unless status.success?
       # Under Clash fake-ip the AAAA answer is a TUN address, so the request succeeds
       # through the proxy and the service sees the node's IPv4. Only a real IPv6
       # exit address means traffic left over the local IPv6 uplink.
+      # An IPv6 exit is only a leak when it is this Mac's own address/prefix; a
+      # proxy node with IPv6 would show its own address instead.
       exit_ip = out.strip
-      if exit_ip.include?(':')
-        Result.new('ipv6', false, "IPv6 直连泄漏：出口为 #{exit_ip}", true)
+      if Leak.own_ipv6?(exit_ip, locals)
+        Result.new('ipv6', false, "IPv6 直连泄漏：出口为本机宽带 IPv6 #{exit_ip}", true)
+      elsif exit_ip.include?(':')
+        Result.new('ipv6', true, "IPv6 请求经代理，出口为节点 IPv6 #{exit_ip}", true)
       else
         Result.new('ipv6', true, "IPv6 请求经 TUN 代理，出口 #{exit_ip}", true)
       end
+    end
+
+    # Under Clash TUN with fake-ip, the system resolver answers from 198.18.0.0/15:
+    # every lookup is answered by Clash and none reaches the ISP's DNS server.
+    def self.system_dns_check
+      answers = Timeout.timeout(5) { Addrinfo.getaddrinfo('example.com', 443, :INET, :STREAM).map(&:ip_address).uniq }
+      fake = Resolver::FAKE_IP_RANGE
+      if !answers.empty? && answers.all? { |ip| fake.include?(IPAddr.new(ip)) }
+        Result.new('system_dns', true, "系统 DNS 由 Clash 接管（fake-ip #{answers.first}），不会发往运营商 DNS", false)
+      else
+        Result.new('system_dns', false, "系统 DNS 返回真实地址 #{answers.join(',')}：未确认由 Clash 接管（非 fake-ip 模式时属正常，PF 仍拦截直连 DNS）", false)
+      end
+    rescue StandardError => e
+      Result.new('system_dns', false, "系统 DNS 解析失败：#{e.message}", false)
     end
 
     def self.timezone_check(config)

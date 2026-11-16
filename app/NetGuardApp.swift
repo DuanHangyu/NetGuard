@@ -661,7 +661,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showAbout() {
         let alert = NSAlert()
-        alert.messageText = "NetGuard 0.4.0"
+        alert.messageText = "NetGuard 0.5.0"
         alert.informativeText = "macOS 主机 fail-closed 网络锁。\n\n复用 Clash/Mihomo TUN，以 PF 兜底。它降低代理故障导致的意外直连风险，但不能保证账号不被封禁，也不提供 Cage 的独立文件系统或应用隔离。"
         alert.addButton(withTitle: "知道了")
         alert.runModal()

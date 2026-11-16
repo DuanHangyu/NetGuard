@@ -1,4 +1,4 @@
-# NetGuard 0.4.0
+# NetGuard 0.5.0
 
 NetGuard 是 macOS 主机上的 fail-closed 网络锁：复用 Clash/Mihomo TUN，以 PF 防火墙兜底。代理或 TUN 失效时，保持断网而不是自动恢复家庭宽带直连。
 
@@ -23,7 +23,7 @@ NetGuard 是 macOS 主机上的 fail-closed 网络锁：复用 Clash/Mihomo TUN�
 - 检查当前代理出口，失败时不启用；成功时**锁定这个出口 IP**，之后出口一旦变化就告警。
 - 备份 `/etc/pf.conf`，加载 NetGuard 的 PF anchor。
 - 安装并启动 `com.netguard.monitor` 后台监控：自愈防火墙、跟随 Clash 配置、适配 TUN 和节点 IP 变化、核对出口 IP；异常只保持锁网，绝不自动关闭 PF。
-- 检查终端出口、物理网卡直连、公共 DNS 和 IPv6。
+- 检查终端出口、物理网卡直连、公共 DNS、系统 DNS 是否由 Clash 接管，以及 IPv6（与本机宽带 IPv6 前缀比对）。
 
 浏览器语言和时区检查由“检查环境”按钮单独触发，避免每次启动都等待浏览器页面。
 
@@ -51,12 +51,16 @@ sudo /Users/qing/Projects/NetGuard/bin/netguard-recovery
 
 ### 后台监控（含自愈与开机保护）
 
-启用时安装 `/Library/LaunchDaemons/com.netguard.monitor.plist`（root、开机自动运行），停止时移除。每个周期（默认 20 秒）依次：
+启用时安装 `/Library/LaunchDaemons/com.netguard.monitor.plist`（root、开机自动运行），停止时移除。
+
+防火墙是否完好每 **2 秒**核对一次（`heal_interval`）：只调用本机 `pfctl`，不联网。被关掉或改动后最多约 2 秒就恢复锁网。完整检查每 20 秒一次（`check_interval`），依次：
 
 1. **自愈**：确认 PF 已启用、主规则集引用了 NetGuard anchor、anchor 内有规则、`/etc/pf.conf` 仍有托管行。任何一项被其他软件、系统更新或 `pfctl -d` 改掉，都会立即用上次的规则重新锁网，并在窗口和系统通知中提示。
 2. **跟随 Clash 配置**：Clash Verge 运行配置变化（订阅更新、切换配置）时，重新导入节点和引导 DNS；配置读取失败时保留上一份。
 3. **更新规则**：TUN 或节点 IP 变化时重新加载 PF。
 4. **核对出口**：出口 IP 与启用时锁定的地址不同就告警（只告警，不额外断网）。想换出口时，停止后重新启动保护即可重新锁定；也可用 `configure --expected-ip` 指定。
+
+**日志**：`~/.netguard/watch.log` 只在状态变化时写一行，另外每 30 分钟写一行“仍正常”。超过 1 MB 时自动轮转为 `watch.log.1`，最新状态始终在 `health.json`。
 
 **开机保护**：监控随系统启动运行，第一步就是自愈，用上次的规则锁网，不依赖 DNS 或网络。因此重启后无需打开应用，保护会自动恢复。启动早期在 launchd 拉起监控之前仍有极短窗口，这是用户态程序的限制。
 ### 国内直连（微信等国内应用）
@@ -78,7 +82,8 @@ sudo /Users/qing/Projects/NetGuard/bin/netguard-recovery
 
 - 仅允许 TUN、指定代理端点、回环及可选局域网流量；其他出站流量默认阻断。
 - DNS/DoT 阻断规则先于局域网放行，IPv6 仅能通过已批准的 TUN。
-- 分别检查终端出口、物理接口直连、公共 DNS、IPv6、系统时区和 Chrome 语言。
+- 分别检查终端出口、物理接口直连、公共 DNS、系统 DNS 接管、IPv6、系统时区和 Chrome 语言。
+- 「检查环境」打开本地页面，检查浏览器层面的泄露：WebRTC 是否暴露真实 IP；浏览器的 IPv4 出口是否与终端一致；浏览器 IPv6 是否走了本机宽带。
 - 本地浏览器页面回传 JS 实际读取到的语言和时区，不收集 Cookie 或历史。
 - 监控自愈防火墙、开机即锁网、锁定并核对出口 IP、跟随 Clash 配置变化，绝不因代理故障自动关闭防火墙。
 - 提供不依赖 DNS 或外网的本地恢复入口。
