@@ -90,12 +90,14 @@ module NetGuard
     def self.timezone_check(config)
       actual = System.timezone
       expected = config['expected_timezone']
+      return Result.new('timezone', true, "系统时区：#{actual}（未设定期望值）", false) if expected.to_s.empty?
       Result.new('timezone', actual == expected, "系统时区：#{actual}（期望 #{expected}）", false)
     end
 
     def self.language_check(config)
       languages = System.chrome_languages
       expected = config['expected_language']
+      return Result.new('chrome_language', true, "Chrome 语言：#{languages.join(',')}（未设定期望值）", false) if expected.to_s.empty? && languages.any?
       if languages.empty?
         # macOS privacy (TCC) often blocks reading Chrome's profile; the browser
         # check (--browser) reports the real navigator.languages instead.

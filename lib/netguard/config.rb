@@ -7,8 +7,10 @@ module NetGuard
     DEFAULTS = {
       'version' => 1,
       'tun_interface' => 'auto',
-      'expected_timezone' => 'America/Chicago',
-      'expected_language' => 'en-US',
+      # nil = no expectation: the browser is compared with this Mac's own
+      # timezone, and language is only reported. Set them with configure.
+      'expected_timezone' => nil,
+      'expected_language' => nil,
       'expected_ip' => nil,
       'allow_lan' => true,
       'block_ipv6' => true,

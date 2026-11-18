@@ -288,8 +288,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         workQueue.async { [weak self] in
             guard let self else { return }
             self.appendLog("1/5 仅导入代理端点（不保存凭据）…")
-            let configured = self.backend(["configure", "--from", yaml, "--tun", "auto",
-                                           "--timezone", "America/Chicago", "--language", "en-US"])
+            let configured = self.backend(["configure", "--from", yaml, "--tun", "auto"])
             self.appendLog(configured.output)
             guard configured.succeeded else {
                 self.finishStartWithError("配置导入失败", configured.output)
@@ -661,7 +660,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showAbout() {
         let alert = NSAlert()
-        alert.messageText = "NetGuard 0.5.0"
+        alert.messageText = "NetGuard 0.5.1"
         alert.informativeText = "macOS 主机 fail-closed 网络锁。\n\n复用 Clash/Mihomo TUN，以 PF 兜底。它降低代理故障导致的意外直连风险，但不能保证账号不被封禁，也不提供 Cage 的独立文件系统或应用隔离。"
         alert.addButton(withTitle: "知道了")
         alert.runModal()

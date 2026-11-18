@@ -14,9 +14,15 @@ fi
 rm -rf "$APP" "$BUILD"
 mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources" "$BUILD" "$ICONSET"
 
-swiftc -O -target arm64-apple-macosx12.0 \
-  "$PROJECT_ROOT/app/NetGuardApp.swift" \
-  -o "$CONTENTS/MacOS/NetGuard"
+# Universal binary: Apple silicon (macOS 12+) and Intel (macOS 13+; current
+# Swift toolchains no longer link x86_64 for macOS 12).
+for target in arm64-apple-macosx12.0 x86_64-apple-macosx13.0; do
+  arch="${target%%-*}"
+  swiftc -O -target "$target" \
+    "$PROJECT_ROOT/app/NetGuardApp.swift" \
+    -o "$BUILD/NetGuard-$arch"
+done
+lipo -create "$BUILD/NetGuard-arm64" "$BUILD/NetGuard-x86_64" -o "$CONTENTS/MacOS/NetGuard"
 
 cp "$PROJECT_ROOT/app/Info.plist" "$CONTENTS/Info.plist"
 cp "$PROJECT_ROOT/app/Privileged.applescript" "$CONTENTS/Resources/Privileged.applescript"

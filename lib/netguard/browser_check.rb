@@ -57,11 +57,15 @@ module NetGuard
     # exit (nil when unknown).
     def evaluate(report, exit_ip, locals = Leak.local_ipv6)
       checks = []
-      expected_tz = @config.data['expected_timezone']
-      expected_lang = @config.data['expected_language']
-      checks << Checks::Result.new('browser_timezone', report['timezone'] == expected_tz, "浏览器时区：#{report['timezone']}", false)
+      expected_tz = @config.data['expected_timezone'].to_s
+      expected_tz = System.timezone if expected_tz.empty?
+      checks << Checks::Result.new('browser_timezone', report['timezone'] == expected_tz,
+                                   "浏览器时区：#{report['timezone']}（期望 #{expected_tz}）", false)
       languages = Array(report['languages'])
-      checks << Checks::Result.new('browser_language', languages.first == expected_lang, "浏览器语言：#{languages.join(',')}", false)
+      expected_lang = @config.data['expected_language'].to_s
+      lang_ok = expected_lang.empty? || languages.first == expected_lang
+      checks << Checks::Result.new('browser_language', lang_ok,
+                                   "浏览器语言：#{languages.join(',')}#{expected_lang.empty? ? '' : "（期望首位 #{expected_lang}）"}", false)
       checks << browser_exit(report['browser_ipv4'], exit_ip)
       checks << browser_ipv6(report['browser_ipv6'], exit_ip, locals)
       checks << webrtc(report['webrtc'] || {}, exit_ip, locals)

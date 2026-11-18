@@ -212,6 +212,23 @@ class NetGuardTest < Minitest::Test
     refute NetGuard::Leak.exposes_real_ip?('192.168.1.5', '66.1.2.3', locals)
   end
 
+  def test_timezone_and_language_need_no_expectation_by_default
+    assert_nil NetGuard::Config::DEFAULTS['expected_timezone']
+    assert NetGuard::Checks.timezone_check('expected_timezone' => nil).ok?
+    NetGuard::System.stub(:chrome_languages, ['zh-CN']) do
+      assert NetGuard::Checks.language_check('expected_language' => nil).ok?
+    end
+    @config.data['expected_timezone'] = nil
+    @config.data['expected_language'] = nil
+    NetGuard::System.stub(:timezone, 'Asia/Shanghai') do
+      ok = browser_results({ 'timezone' => 'Asia/Shanghai', 'languages' => ['zh-CN'], 'browser_ipv4' => '66.1.2.3' })
+      assert ok['browser_timezone'].ok?
+      assert ok['browser_language'].ok?
+      bad = browser_results({ 'timezone' => 'America/Chicago', 'browser_ipv4' => '66.1.2.3' })
+      refute bad['browser_timezone'].ok?
+    end
+  end
+
   def test_language_check_passes_when_chrome_prefs_unreadable
     NetGuard::System.stub(:chrome_languages, []) do
       r = NetGuard::Checks.language_check('expected_language' => 'en-US')

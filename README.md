@@ -1,8 +1,49 @@
-# NetGuard 0.5.0
+# NetGuard 0.5.1
 
 NetGuard 是 macOS 主机上的 fail-closed 网络锁：复用 Clash/Mihomo TUN，以 PF 防火墙兜底。代理或 TUN 失效时，保持断网而不是自动恢复家庭宽带直连。
 
 > **代码和离线测试完成不等于保护已开启。** 图形应用启动时只读取状态；只有点击“一键启动保护”并完成 macOS 管理员授权后，才会修改 PF。
+
+## 在新 Mac 上安装
+
+### 前提条件
+
+- **macOS**：Apple 芯片（M 系列）需要 macOS 12 或更高版本，Intel 芯片需要 macOS 13 或更高版本。
+- **Clash Verge Rev**：需要已经能正常使用，并且开启 **TUN 模式**。NetGuard 不提供代理，只在 Clash 失效时锁住网络。Mihomo 内核的其他客户端也可以用，但要手动选择 YAML；「国内直连」需要 Clash Verge Rev 自带的 `geoip.dat`。
+- **Apple 命令行开发工具**：编译 App 时需要，只装一次：
+
+  ```sh
+  xcode-select --install
+  ```
+
+后端使用 macOS 自带的 Ruby，不需要安装任何第三方依赖。
+
+### 安装
+
+```sh
+git clone https://github.com/DuanHangyu/NetGuard.git ~/NetGuard
+cd ~/NetGuard
+app/build_app.sh
+ditto dist/NetGuard.app /Applications/NetGuard.app
+open -a NetGuard
+```
+
+在自己的 Mac 上编译，App 会使用本机 ad-hoc 签名，可以直接打开。如果把编译好的 App 直接拷给别人，因为没有经过 Apple 公证，对方的 Mac 会阻止打开。所以请每个人在自己的电脑上编译。
+
+### 第一次使用前
+
+1. 先保存手头的工作。启用保护后，如果 Clash 出问题，整台 Mac 都会断网，这是 NetGuard 的设计目的。
+2. 记住紧急恢复方法（见下文「停止与紧急恢复」）：
+
+   ```sh
+   sudo /Applications/NetGuard.app/Contents/Resources/netguard/bin/netguard-recovery
+   ```
+
+3. 时区和语言检查默认不设定期望值：浏览器时区会和本机系统时区对比，语言只做显示。如果要固定期望值（例如让代理所在地区和时区一致），可以运行：
+
+   ```sh
+   /Applications/NetGuard.app/Contents/Resources/netguard/bin/netguard configure --timezone America/Los_Angeles --language en-US
+   ```
 
 ## 最简单：使用 NetGuard.app
 
@@ -41,10 +82,10 @@ NetGuard 是 macOS 主机上的 fail-closed 网络锁：复用 Clash/Mihomo TUN�
 sudo /Applications/NetGuard.app/Contents/Resources/netguard/bin/netguard recovery
 ```
 
-开发目录中的恢复入口仍可使用：
+源码目录里的恢复入口也可以用：
 
 ```sh
-sudo /Users/qing/Projects/NetGuard/bin/netguard-recovery
+sudo ~/NetGuard/bin/netguard-recovery   # 换成你 clone 仓库的位置
 ```
 
 不要为了恢复而盲目执行 `pfctl -F all`，那可能影响其他防火墙使用方。
@@ -99,10 +140,10 @@ sudo /Users/qing/Projects/NetGuard/bin/netguard-recovery
 
 ## 构建和安装应用
 
-在本机使用 Apple Swift、AppKit、Ruby 和 macOS 自带工具构建，无第三方 Ruby 依赖：
+在本机使用 Apple Swift、AppKit、Ruby 和 macOS 自带工具构建，无第三方 Ruby 依赖。构建出的是通用二进制文件，同时支持 Apple 芯片和 Intel：
 
 ```sh
-cd /Users/qing/Projects/NetGuard
+cd ~/NetGuard   # 你 clone 仓库的位置
 app/build_app.sh
 ditto dist/NetGuard.app /Applications/NetGuard.app
 open -a NetGuard
@@ -119,14 +160,14 @@ open -a NetGuard
 ## 命令行使用（高级用户）
 
 ```sh
-cd /Users/qing/Projects/NetGuard
+cd ~/NetGuard   # 你 clone 仓库的位置
 
 # 只读诊断
 bin/netguard doctor
 
 # 仅导入端点，不修改 PF
 bin/netguard configure --from /path/to/config.yaml \
-  --tun auto --timezone America/Chicago --language en-US
+  --tun auto   # 可选：--timezone Area/City --language xx-XX
 
 # 检查规则与启用前代理环境
 bin/netguard plan

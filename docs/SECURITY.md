@@ -60,7 +60,7 @@ Clash TUN 的 fake-ip 模式会把节点域名在系统解析里变成 198.18.x�
 先运行：
 
 ```sh
-sudo /Users/qing/Projects/NetGuard/bin/netguard-recovery
+sudo /Applications/NetGuard.app/Contents/Resources/netguard/bin/netguard-recovery
 ```
 
 恢复只移除 NetGuard 托管的 anchor 和 `/etc/pf.conf` 中的标记行。它不会删除 Clash 配置，也不会自动重置 macOS 系统代理。
